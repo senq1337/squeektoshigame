@@ -7,6 +7,9 @@
 //                                   (also sets the bot up on first call: webhook, menu button)
 //   POST /api/spin                  { revs, seq } + header X-Init-Data  -> accepted revs, my stats
 //   GET  /api/me                    my day, totals, friends invited, my invite link (X-Init-Data)
+//   POST /api/notify                { on } -> opt in/out of "he's running" pings
+//   GET  /api/avatar                my Telegram profile photo (proxied: file URLs contain the token)
+//   POST /api/card                  PNG bytes of my card -> the bot sends it to my private chat
 //   GET  /api/leaderboard?scope=today|all
 //   POST /tg/webhook                Telegram bot updates (/start [r<id>], /top, /hamster, /invite, buttons)
 // Referrals: t.me/<bot>?start=r<id> (or a Mini App link with startapp=r<id>) marks the new player
@@ -21,8 +24,12 @@ import {
   boostMilli,
   hamsterDelta,
   humanWork,
+  nextPingRun,
   parseRef,
+  PING_BATCH,
+  PING_COOLDOWN_MS,
   pointsFor,
+  type PingRun,
   refBonus,
   REF_BONUS_PCT,
   stepWake,
@@ -35,7 +42,9 @@ import {
   esc,
   sendMessage,
   sendPhoto,
+  sendPhotoBytes,
   tgCall,
+  userPhoto,
   verifyInitData,
   type InlineButton,
   type TgUser,
@@ -107,7 +116,7 @@ const spinButton = (env: Env, appUrl: string, text = "🐹 Spin the wheel"): Inl
 // ---------------------------------------------------------------- one-time bot setup
 
 /** Bump to re-run setup after changing commands/texts. */
-const SETUP_VERSION = 2;
+const SETUP_VERSION = 3;
 const BOT_NAME = "Squeektoshi Game";
 
 interface SetupState {
@@ -173,6 +182,7 @@ export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
         { command: "hamster", description: "Is Squeektoshi running right now?" },
         { command: "top", description: "Today's top spinners" },
         { command: "invite", description: "Your invite link (+10% of friends' points)" },
+        { command: "alerts", description: "Ping me when Squeektoshi runs (on/off)" },
       ],
     }),
     tgCall(t, "setMyShortDescription", {
@@ -269,6 +279,77 @@ async function rankFor(env: Env, scope: "today" | "all", day: string, points: nu
   return (ahead?.n ?? 0) + 1;
 }
 
+// ---------------------------------------------------------------- pings + cards
+
+const alertsText = (on: boolean) =>
+  on
+    ? "🔔 Done. I'll ping you when Squeektoshi starts running (at most once every 3 hours). /alerts off to stop."
+    : "🔕 Pings are off. /alerts on to turn them back on.";
+
+async function setNotify(env: Env, u: { id: number; username?: string; first_name?: string }, on: boolean, now: number) {
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO players (id, username, first_name, created_at) VALUES (?, ?, ?, ?)").bind(
+      u.id,
+      u.username ?? null,
+      u.first_name ?? null,
+      now,
+    ),
+    env.DB.prepare("UPDATE players SET notify = ? WHERE id = ?").bind(on ? 1 : 0, u.id),
+  ]);
+}
+
+async function handleNotify(req: Request, env: Env): Promise<Response> {
+  const user = await authUser(req, env);
+  if (!user) return json(env, { error: "unauthorized" }, 401);
+  const body = (await req.json().catch(() => ({}))) as { on?: unknown };
+  const on = body.on === true;
+  await setNotify(env, user, on, Date.now());
+  // Confirm in the chat; if the bot can't message them yet, tell the app so it can say "press Start".
+  const r = (await sendMessage(env.BOT_TOKEN, user.id, alertsText(on))) as { ok?: boolean } | null;
+  if (!r?.ok) await env.DB.prepare("UPDATE players SET chat_ok = 0 WHERE id = ?").bind(user.id).run();
+  else await env.DB.prepare("UPDATE players SET chat_ok = 1 WHERE id = ?").bind(user.id).run();
+  return json(env, { notify: on, chatOk: !!r?.ok });
+}
+
+async function handleAvatar(req: Request, env: Env): Promise<Response> {
+  const user = await authUser(req, env);
+  if (!user) return json(env, { error: "unauthorized" }, 401);
+  const bytes = env.BOT_TOKEN ? await userPhoto(env.BOT_TOKEN, user.id) : null;
+  if (!bytes) return json(env, { error: "no_photo" }, 404);
+  return new Response(bytes, { headers: { "content-type": "image/jpeg", "cache-control": "private, max-age=3600", ...cors(env) } });
+}
+
+const CARD_MAX_BYTES = 1_500_000;
+const CARD_COOLDOWN_MS = 30_000;
+
+async function handleCard(req: Request, env: Env): Promise<Response> {
+  const user = await authUser(req, env);
+  if (!user) return json(env, { error: "unauthorized" }, 401);
+  const now = Date.now();
+  const p = await env.DB.prepare("SELECT last_card_at FROM players WHERE id = ?").bind(user.id).first<{ last_card_at: number }>();
+  if (p && now - p.last_card_at < CARD_COOLDOWN_MS) return json(env, { error: "slow_down" }, 429);
+
+  const bytes = await req.arrayBuffer();
+  const sig = new Uint8Array(bytes.slice(0, 8));
+  const isPng = sig.length === 8 && sig[0] === 0x89 && sig[1] === 0x50 && sig[2] === 0x4e && sig[3] === 0x47;
+  if (!isPng || bytes.byteLength > CARD_MAX_BYTES) return json(env, { error: "bad_image" }, 400);
+
+  await env.DB.prepare("UPDATE players SET last_card_at = ? WHERE id = ?").bind(now, user.id).run();
+  const url = env.WEBAPP_URL || new URL(req.url).origin;
+  const username = await botUsername(env);
+  const link = inviteLink(env, username, user.id);
+  const caption =
+    "🐹 Your Squeektoshi card. Forward it or save it and post it on X." +
+    (link ? `\n\nYour invite link: ${esc(link)}` : "");
+  const r = await sendPhotoBytes(env.BOT_TOKEN, user.id, bytes, "squeektoshi-card.png", caption, [[{ text: "🐹 Spin the wheel", web_app: { url } }]]);
+  if (r?.ok) return json(env, { sent: true });
+  if (r?.error_code === 403 || r?.error_code === 400) {
+    await env.DB.prepare("UPDATE players SET chat_ok = 0 WHERE id = ?").bind(user.id).run();
+    return json(env, { sent: false, reason: "start_bot" });
+  }
+  return json(env, { sent: false, reason: "telegram" }, 502);
+}
+
 // ---------------------------------------------------------------- API handlers
 
 /** Everything the app shows about the current player, in one call (used on open). */
@@ -278,9 +359,9 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
   const day = utcDay(Date.now());
   const db = env.DB;
   const [p, d, friends, username] = await Promise.all([
-    db.prepare("SELECT total_revs, total_points, ref_points FROM players WHERE id = ?")
+    db.prepare("SELECT total_revs, total_points, ref_points, notify, chat_ok FROM players WHERE id = ?")
       .bind(user.id)
-      .first<{ total_revs: number; total_points: number; ref_points: number }>(),
+      .first<{ total_revs: number; total_points: number; ref_points: number; notify: number; chat_ok: number }>(),
     db.prepare("SELECT revs, points FROM daily WHERE day = ? AND player_id = ?")
       .bind(day, user.id)
       .first<{ revs: number; points: number }>(),
@@ -296,6 +377,7 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
     total: { revs: p?.total_revs ?? 0, points: p?.total_points ?? 0 },
     invites: { friends: friends?.n ?? 0, active: friends?.active ?? 0, bonusPoints: p?.ref_points ?? 0, pct: REF_BONUS_PCT },
     inviteLink: inviteLink(env, username, user.id),
+    alerts: { on: p?.notify === 1, chatOk: p ? p.chat_ok === 1 : false },
   });
 }
 
@@ -509,6 +591,11 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
     const chatId = cb.message?.chat?.id;
     if (chatId && cb.data === "top") await sendMessage(t, chatId, await topText(env, utcDay(now)), [[{ text: "🐹 Spin the wheel", web_app: { url } }]]);
     if (chatId && cb.data === "hamster") await sendMessage(t, chatId, await hamsterText(env, now), [[{ text: "🐹 Spin the wheel", web_app: { url } }]]);
+    if (chatId && cb.from?.id && (cb.data === "alerts_on" || cb.data === "alerts_off")) {
+      const on = cb.data === "alerts_on";
+      await setNotify(env, cb.from, on, now);
+      await sendMessage(t, chatId, alertsText(on));
+    }
     return new Response("ok");
   }
 
@@ -535,6 +622,8 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
       )
         .bind(from.id, from.username ?? null, from.first_name ?? null, now)
         .run();
+      // They opened a private chat with the bot, so we can message them now.
+      await env.DB.prepare("UPDATE players SET chat_ok = 1 WHERE id = ?").bind(from.id).run();
     }
     const caption =
       `🐹 <b>${BOT_NAME}</b>\n\n` +
@@ -550,6 +639,7 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
       if (myLink) row.push({ text: "👥 Invite friends", url: shareUrl(myLink) });
       row.push({ text: "🏆 Top", callback_data: "top" });
       keyboard.push(row);
+      keyboard.push([{ text: "🔔 Ping me when he runs", callback_data: "alerts_on" }]);
     }
     const sent = (await sendPhoto(t, chatId, `${origin}/welcome.png`, caption, keyboard)) as { ok?: boolean } | null;
     if (!sent?.ok) await sendMessage(t, chatId, caption, keyboard); // e.g. image not deployed yet
@@ -557,6 +647,10 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
     await sendMessage(t, chatId, await hamsterText(env, now), [[spin]]);
   } else if (cmd === "/top") {
     await sendMessage(t, chatId, await topText(env, utcDay(now)), [[spin]]);
+  } else if (cmd === "/alerts" && isPrivate && from) {
+    const on = (payload ?? "on").toLowerCase() !== "off";
+    await setNotify(env, from, on, now);
+    await sendMessage(t, chatId, alertsText(on), [[on ? { text: "Turn off", callback_data: "alerts_off" } : { text: "Turn on", callback_data: "alerts_on" }]]);
   } else if (cmd === "/invite" && isPrivate && from) {
     if (!myLink) {
       await sendMessage(t, chatId, "Invite links will be ready in a minute. Try /invite again shortly.");
@@ -615,6 +709,52 @@ async function everyMinute(env: Env) {
         : `😴 <b>Squeektoshi went to sleep</b> after ~${Math.max(1, Math.round(event.ranMs / 60000))} min of running.\nNight shift starts: 1000 human spins = 1 hamster turn.`;
     await sendMessage(env.BOT_TOKEN, env.ALERT_CHAT_ID, text, [[spinButton(env, await appUrl(env))]]);
   }
+
+  // 3) "He's running" pings to players who opted in, PING_BATCH per run.
+  const run = nextPingRun(await kvGet<PingRun>(db, "ping_run"), next.state, event?.kind === "woke", now);
+  if (!run) {
+    await db.prepare("DELETE FROM kv WHERE key = 'ping_run'").run();
+  } else if (!run.done && env.BOT_TOKEN) {
+    await sendPingBatch(env, run, h, now);
+    await kvPut(db, "ping_run", run, now).run();
+  }
+}
+
+async function sendPingBatch(env: Env, run: PingRun, h: HamsterState, now: number) {
+  const rows = await env.DB.prepare(
+    "SELECT id FROM players WHERE notify = 1 AND chat_ok = 1 AND id > ? AND last_ping_at < ? ORDER BY id LIMIT ?",
+  )
+    .bind(run.cursor, now - PING_COOLDOWN_MS, PING_BATCH)
+    .all<{ id: number }>();
+  const ids = rows.results.map((r) => r.id);
+  if (ids.length < PING_BATCH) run.done = true;
+  if (!ids.length) return;
+  run.cursor = ids[ids.length - 1];
+
+  const url = await appUrl(env);
+  const boost = (boostMilli(true, h.rpm) / 1000).toFixed(1);
+  const text =
+    `🐹 <b>Squeektoshi is running!</b>\nEvery spin counts ×${boost} while he runs. Spin with him now.\n\n` +
+    "<i>/alerts off to stop these pings</i>";
+  const sent: number[] = [];
+  const blocked: number[] = [];
+  for (let i = 0; i < ids.length; i += 20) {
+    // 20 at a time keeps us under Telegram's ~30 messages/second
+    const chunk = ids.slice(i, i + 20);
+    const res = await Promise.all(
+      chunk.map((id) => sendMessage(env.BOT_TOKEN, id, text, url ? [[{ text: "🐹 Spin now", web_app: { url } }]] : undefined)),
+    );
+    res.forEach((r: any, j) => {
+      if (r?.ok) sent.push(chunk[j]);
+      else if (r?.error_code === 403 || r?.error_code === 400) blocked.push(chunk[j]); // blocked the bot / never started it
+    });
+  }
+  const db = env.DB;
+  const writes = [
+    ...sent.map((id) => db.prepare("UPDATE players SET last_ping_at = ? WHERE id = ?").bind(now, id)),
+    ...blocked.map((id) => db.prepare("UPDATE players SET chat_ok = 0 WHERE id = ?").bind(id)),
+  ];
+  if (writes.length) await db.batch(writes);
 }
 
 async function dailyRecap(env: Env) {
@@ -678,6 +818,9 @@ export default {
       if (pathname === "/api/state" && req.method === "GET") return await handleState(req, env, ctx);
       if (pathname === "/api/spin" && req.method === "POST") return await handleSpin(req, env);
       if (pathname === "/api/me" && req.method === "GET") return await handleMe(req, env);
+      if (pathname === "/api/notify" && req.method === "POST") return await handleNotify(req, env);
+      if (pathname === "/api/avatar" && req.method === "GET") return await handleAvatar(req, env);
+      if (pathname === "/api/card" && req.method === "POST") return await handleCard(req, env);
       if (pathname === "/api/leaderboard" && req.method === "GET") return await handleLeaderboard(req, env);
       if (pathname === "/tg/webhook" && req.method === "POST") return await handleWebhook(req, env);
       // Local testing only (DEV_ALLOW_UNSIGNED=1): run the recap job on demand.

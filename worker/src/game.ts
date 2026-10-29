@@ -72,6 +72,26 @@ export function humanWork(revs: number): number {
   return revs / HUMAN_REVS_PER_HAMSTER_WORK;
 }
 
+// ---- Wake-up pings -----------------------------------------------------------
+
+/** A player gets at most one "he's running" ping in this window. */
+export const PING_COOLDOWN_MS = 3 * 60 * 60 * 1000;
+/** Pings sent per cron run (the free plan allows 50 outgoing requests per run). */
+export const PING_BATCH = 40;
+
+export interface PingRun {
+  startedAt: number;
+  cursor: number; // last player id processed
+  done: boolean;
+}
+
+/** Start a run when he wakes; stop it as soon as he's asleep again (stale news). */
+export function nextPingRun(run: PingRun | null, wakeState: WheelState, wokeNow: boolean, now: number): PingRun | null {
+  if (wokeNow) return { startedAt: now, cursor: 0, done: false };
+  if (wakeState !== "awake") return null;
+  return run;
+}
+
 // ---- Referrals -------------------------------------------------------------
 
 /** The inviter earns this % of every point their friend earns (from real, speed-capped spins). */

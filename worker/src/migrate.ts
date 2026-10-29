@@ -18,6 +18,14 @@ export const MIGRATIONS: string[][] = [
     "ALTER TABLE players ADD COLUMN ref_points INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS players_ref ON players (ref_by)",
   ],
+  // 3: wake-up pings (opt-in) and personal cards
+  [
+    "ALTER TABLE players ADD COLUMN notify INTEGER NOT NULL DEFAULT 0", // 1 = ping me when he runs
+    "ALTER TABLE players ADD COLUMN last_ping_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN chat_ok INTEGER NOT NULL DEFAULT 1", // 0 = bot can't message them
+    "ALTER TABLE players ADD COLUMN last_card_at INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS players_notify ON players (notify, id)",
+  ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

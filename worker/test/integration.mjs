@@ -2,6 +2,7 @@
 //   node test/integration.mjs http://127.0.0.1:8787 http://127.0.0.1:8799
 // Needs an empty local D1 (re-apply schema.sql or DELETE FROM the four tables first).
 import { createHmac } from "node:crypto";
+import { execSync } from "node:child_process";
 import assert from "node:assert/strict";
 
 const API = process.argv[2] ?? "http://127.0.0.1:8787";
@@ -146,6 +147,36 @@ assert.equal(r.status, 200);
 me42 = await (await fetch(`${API}/api/me`, { headers: { "x-init-data": initData(user) } })).json();
 assert.equal(me42.invites.friends, 1);
 step("startapp=r42 in initData registers the referral on first spin");
+
+// 12. Wake-up pings: opt in, then the hamster wakes -> a ping run starts and finishes
+let n = await (await fetch(`${API}/api/notify?dev_user=7`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ on: true }) })).json();
+assert.equal(n.notify, true);
+// No Telegram here, so the confirmation fails and chat_ok drops to 0; pressing /start restores it.
+let me7b = await (await fetch(`${API}/api/me?dev_user=7`)).json();
+assert.deepEqual(me7b.alerts, { on: true, chatOk: false });
+await hook({ text: "/start", chat: { id: 7, type: "private" }, from: { id: 7, username: "dev7" } });
+me7b = await (await fetch(`${API}/api/me?dev_user=7`)).json();
+assert.deepEqual(me7b.alerts, { on: true, chatOk: true });
+await fetch(`${MOCK}/set?running=1&rpm=40`);
+for (let i = 0; i < 3; i++) { await sleep(10500); await cron(); }
+const kvRun = execSync(`npx wrangler d1 execute squeektoshi -c wrangler.local.jsonc --local --json --command "SELECT value FROM kv WHERE key='ping_run'"`, { encoding: "utf8" });
+const runVal = JSON.parse(JSON.parse(kvRun)[0].results[0].value);
+assert.equal(runVal.done, true);
+assert.ok(runVal.cursor >= 7, "player 7 was in the batch");
+step(`opt-in works; hamster woke -> ping run went through (cursor ${runVal.cursor}, done)`);
+await fetch(`${MOCK}/set?running=0&rpm=0`);
+
+// 13. Card upload + avatar proxy (no Telegram egress here, so sending fails cleanly)
+const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001", "hex");
+let cr = await fetch(`${API}/api/card?dev_user=7`, { method: "POST", headers: { "content-type": "image/png" }, body: png });
+assert.equal(cr.status, 502);
+cr = await fetch(`${API}/api/card?dev_user=7`, { method: "POST", headers: { "content-type": "image/png" }, body: png });
+assert.equal(cr.status, 429);
+cr = await fetch(`${API}/api/card?dev_user=8`, { method: "POST", headers: { "content-type": "image/png" }, body: Buffer.from("not a png") });
+assert.equal(cr.status, 400);
+const av = await fetch(`${API}/api/avatar?dev_user=7`);
+assert.equal(av.status, 404);
+step("card: PNG accepted (send fails offline), 30 s cooldown, non-PNG rejected; avatar 404 without Telegram");
 
 // 10. Recap job runs without crashing (no row for yesterday -> no-op)
 const rc = await fetch(`${API}/dev/recap`);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acceptBatch,
+  nextPingRun,
   parseRef,
   refBonus,
   boostMilli,
@@ -127,5 +128,16 @@ describe("referrals", () => {
     expect(refBonus(100)).toBe(10);
     expect(refBonus(9)).toBe(0);
     expect(refBonus(31)).toBe(3);
+  });
+});
+
+describe("ping runs", () => {
+  it("starts on waking, keeps going while awake, stops when he sleeps", () => {
+    const r = nextPingRun(null, "awake", true, 1000);
+    expect(r).toEqual({ startedAt: 1000, cursor: 0, done: false });
+    const cont = { startedAt: 1000, cursor: 55, done: false };
+    expect(nextPingRun(cont, "awake", false, 2000)).toBe(cont);
+    expect(nextPingRun(cont, "asleep", false, 2000)).toBeNull();
+    expect(nextPingRun(null, "awake", false, 2000)).toBeNull();
   });
 });

@@ -128,7 +128,7 @@
   .board-head { display: flex; align-items: center; justify-content: space-between; }
   .seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 4px; overflow: hidden; }
   .seg button { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; background: none; border: 0; color: var(--gray-lit); padding: 5px 10px; cursor: pointer; }
-  .seg button[aria-selected="true"] { background: var(--active); color: var(--on-active); }
+  .seg button[aria-selected="true"], .seg button[aria-pressed="true"] { background: var(--active); color: var(--on-active); }
   ol { list-style: none; margin: 10px 0 0; padding: 0; }
   li { display: grid; grid-template-columns: 2.6em 1fr auto; gap: 8px; padding: 7px 4px; border-top: 1px solid var(--line); font-size: 13px; }
   li:first-child { border-top: 0; }
@@ -172,8 +172,11 @@
       <div class="stat"><div class="num gold" id="myPts">0</div><p class="label">Points</p></div>
       <div class="stat"><div class="num" id="myRank">–</div><p class="label">Rank</p></div>
     </div>
+    <div class="share" style="grid-template-columns:1fr">
+      <button class="btn primary" id="cardBtn" type="button">Get my card</button>
+    </div>
     <div class="share">
-      <button class="btn primary" id="shareTg" type="button">Share in Telegram</button>
+      <button class="btn" id="shareTg" type="button">Share in Telegram</button>
       <button class="btn" id="shareX" type="button">Post on X</button>
     </div>
   </section>
@@ -189,6 +192,17 @@
     <div class="share" style="grid-template-columns:1fr">
       <button class="btn primary" id="inviteBtn" type="button" disabled>Invite friends</button>
     </div>
+  </section>
+
+  <section class="panel" aria-label="Alerts">
+    <div class="board-head">
+      <p class="label">Wake-up ping</p>
+      <div class="seg" role="group" aria-label="Wake-up ping">
+        <button type="button" id="alertsOn" aria-pressed="false">On</button>
+        <button type="button" id="alertsOff" aria-pressed="true">Off</button>
+      </div>
+    </div>
+    <p class="note" id="alertsNote">The bot messages you when Squeektoshi starts running, at most once every 3 hours.</p>
   </section>
 
   <section class="panel">
@@ -254,6 +268,13 @@
     },
     async board(scope) { const p = "/api/leaderboard?scope=" + scope; const r = await fetch(API + p + qs(p), { headers: hdrs(false) }); if (!r.ok) throw r; return r.json(); },
     async me() { const r = await fetch(API + "/api/me" + qs("/api/me"), { headers: hdrs(false) }); if (!r.ok) throw r; return r.json(); },
+    async notify(on) { const r = await fetch(API + "/api/notify" + qs("/api/notify"), { method: "POST", headers: hdrs(true), body: JSON.stringify({ on }) }); if (!r.ok) throw r; return r.json(); },
+    async avatar() { const r = await fetch(API + "/api/avatar" + qs("/api/avatar"), { headers: hdrs(false) }); return r.ok ? r.blob() : null; },
+    async card(blob) {
+      const h = Object.assign({ "content-type": "image/png" }, initData ? { "x-init-data": initData } : {});
+      const r = await fetch(API + "/api/card" + qs("/api/card"), { method: "POST", headers: h, body: blob });
+      return { status: r.status, body: await r.json().catch(() => ({})) };
+    },
   };
 
   // Demo: Squeektoshi alternates 25 s running / 25 s asleep; fake crowd; your spins count locally.
@@ -289,8 +310,12 @@
     },
     async me() {
       return { today: { revs: demoDb.mine.revs, points: demoDb.mine.pts, rank: null }, total: { revs: demoDb.mine.revs, points: demoDb.mine.pts },
-        invites: { friends: 3, active: 2, bonusPoints: 148, pct: 10 }, inviteLink: "https://t.me/squeektoshigame?start=r1" };
+        invites: { friends: 3, active: 2, bonusPoints: 148, pct: 10 }, inviteLink: "https://t.me/squeektoshigame?start=r1",
+        alerts: { on: !!demoDb.alerts, chatOk: true } };
     },
+    async notify(on) { demoDb.alerts = on; return { notify: on, chatOk: true }; },
+    async avatar() { return null; },
+    async card() { return { status: 0, body: {} }; }, // demo: card is downloaded instead
   };
   const api = DEMO ? demo : real;
 
@@ -364,6 +389,7 @@
       $("frBonus").textContent = fmt(m.invites.bonusPoints);
       $("frNote").textContent = `You get +${m.invites.pct}% of every point your friends spin.`;
       inviteUrl = m.inviteLink;
+      if (m.alerts) renderAlerts(m.alerts.on, m.alerts.chatOk);
       $("inviteBtn").disabled = !inviteUrl;
       $("inviteBtn").textContent = inviteUrl ? "Invite friends" : "Invite link is being set up";
     } catch (_) {}
@@ -460,6 +486,136 @@
     open("https://t.me/share/url?url=" + encodeURIComponent(inviteUrl) + "&text=" +
       encodeURIComponent("Spin the wheel with Squeektoshi, the hamster mining Squeekchain 🐹 When he runs, his rpm boosts your spins."), true);
   });
+
+  // ================================================================ wake-up ping toggle
+  function renderAlerts(on, chatOk) {
+    $("alertsOn").setAttribute("aria-pressed", String(on));
+    $("alertsOff").setAttribute("aria-pressed", String(!on));
+    $("alertsNote").textContent = on && chatOk === false
+      ? "Press Start in the chat with the bot so it can message you."
+      : "The bot messages you when Squeektoshi starts running, at most once every 3 hours.";
+  }
+  async function setAlerts(on) {
+    if (!authed) { toast("Open the wheel from the Telegram bot to turn on pings."); return; }
+    renderAlerts(on);
+    try {
+      const r = await api.notify(on);
+      renderAlerts(r.notify, r.chatOk);
+      toast(r.notify ? (r.chatOk ? "Ping is on. The bot will message you when he runs." : "Press Start in the bot chat so it can message you.") : "Ping is off.");
+    } catch (_) { toast("Couldn't change the ping setting. Try again."); }
+  }
+  $("alertsOn").addEventListener("click", () => setAlerts(true));
+  $("alertsOff").addEventListener("click", () => setAlerts(false));
+
+  // ================================================================ personal card (1200x675, X-friendly)
+  const CARD = { bg: "#0b0b0d", raised: "#0f0f12", line: "#1c1c24", line2: "#26262f", dim: "#3a3a46", gray: "#82828f",
+    white: "#f2f2f4", gold: "#e8b04a", gold2: "#f2c230", blue: "#5b7cfa", green: "#35d07f", pink: "#f06bae", belly: "#f6e6c4", feet: "#b8883a" };
+  const dotC = (c, x, y, r, col) => { c.fillStyle = col; c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill(); };
+  function spriteC(c, rows, x, y, cell) {
+    const col = { b: CARD.gold, l: CARD.belly, e: CARD.bg, p: CARD.pink, f: CARD.feet, z: CARD.gray };
+    rows.forEach((row, j) => [...row].forEach((ch, i) => { if (ch !== ".") dotC(c, x + i * cell + cell / 2, y + j * cell + cell / 2, cell * 0.42, col[ch]); }));
+  }
+  function myName() {
+    const u = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
+    if (u) return u.username ? "@" + u.username : [u.first_name, u.last_name].filter(Boolean).join(" ") || "Spinner";
+    return devUser ? "dev" + devUser : "You";
+  }
+  async function drawCard() {
+    await Promise.all([document.fonts.load('700 60px "Barlow Condensed"'), document.fonts.load('300 60px "Barlow Condensed"'),
+      document.fonts.load('400 20px "IBM Plex Mono"'), document.fonts.load('500 20px "IBM Plex Mono"')]).catch(() => {});
+    const W = 1200, H = 675, cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+    const c = cv.getContext("2d");
+    c.fillStyle = CARD.bg; c.fillRect(0, 0, W, H);
+    for (let x = 11; x < W; x += 22) for (let y = 11; y < H; y += 22) dotC(c, x, y, 1.1, CARD.line2);
+    c.fillStyle = CARD.raised; c.strokeStyle = CARD.line; c.lineWidth = 2;
+    c.beginPath(); c.roundRect(32, 32, W - 64, H - 64, 12); c.fill(); c.stroke();
+
+    // avatar (Telegram photo through our API, else an initial)
+    const ax = 96, ay = 92, AR = 56, name = myName();
+    let drewPhoto = false;
+    try {
+      const blob = await api.avatar();
+      if (blob) {
+        const img = await createImageBitmap(blob);
+        c.save(); c.beginPath(); c.arc(ax + AR, ay + AR, AR, 0, TAU); c.clip();
+        c.drawImage(img, ax, ay, AR * 2, AR * 2); c.restore(); drewPhoto = true;
+      }
+    } catch (_) {}
+    if (!drewPhoto) {
+      dotC(c, ax + AR, ay + AR, AR, CARD.gold);
+      c.fillStyle = CARD.bg; c.font = '700 64px "Barlow Condensed"'; c.textAlign = "center"; c.textBaseline = "middle";
+      c.fillText((name.replace("@", "")[0] || "?").toUpperCase(), ax + AR, ay + AR + 3);
+    }
+    c.strokeStyle = CARD.gold; c.lineWidth = 3; c.beginPath(); c.arc(ax + AR, ay + AR, AR + 4, 0, TAU); c.stroke();
+
+    c.textAlign = "left"; c.textBaseline = "alphabetic";
+    c.fillStyle = CARD.white; c.font = '700 56px "Barlow Condensed"';
+    let shown = name; while (c.measureText(shown).width > 470 && shown.length > 4) shown = shown.slice(0, -2) + "…";
+    c.fillText(shown, 236, 142);
+    c.fillStyle = CARD.gray; c.font = '400 20px "IBM Plex Mono"';
+    const day = (S && S.day) || new Date().toISOString().slice(0, 10);
+    c.fillText(("Squeektoshi Game, " + day).toUpperCase(), 238, 178);
+
+    // stats
+    const stats = [["SPINS", fmt(myRevs), CARD.white], ["POINTS", fmt(Math.floor(myPts)), CARD.gold2], ["RANK", myRank ? "#" + fmt(myRank) : "–", CARD.white]];
+    stats.forEach(([lbl, val, col], i) => {
+      const x = 96 + i * 196;
+      c.fillStyle = col; c.font = '300 92px "Barlow Condensed"'; c.fillText(val, x, 330);
+      c.fillStyle = CARD.gray; c.font = '400 18px "IBM Plex Mono"'; c.fillText(lbl, x + 2, 362);
+    });
+
+    // humans vs hamster (dot bars)
+    const ham = S ? S.today.hamsterWork : 0, hum = S ? S.today.humanWork : 0, mx = Math.max(ham, hum, 1e-9);
+    c.fillStyle = CARD.gray; c.font = '400 18px "IBM Plex Mono"'; c.fillText("HUMANS VS HAMSTER TODAY", 98, 430);
+    [["HAMSTER", ham, CARD.gold], ["HUMANS", hum, CARD.blue]].forEach(([lbl, v, col], j) => {
+      const y = 470 + j * 44;
+      c.fillStyle = CARD.gray; c.font = '400 17px "IBM Plex Mono"'; c.fillText(lbl, 98, y + 6);
+      let on = Math.round((v / mx) * 24); if (v > 0 && on === 0) on = 1;
+      for (let k = 0; k < 24; k++) dotC(c, 214 + k * 15, y, 5, k < on ? col : CARD.line2);
+      c.fillStyle = CARD.white; c.font = '300 34px "Barlow Condensed"';
+      c.fillText(v < 10 && lbl === "HUMANS" ? fmt(v, 2) : fmt(v), 590, y + 11);
+    });
+
+    // the wheel with the hamster: running inside, or asleep beside it
+    const cx = 900, cy = 300, R = 190, running = S && S.hamster.running;
+    for (let i = 0; i < 72; i++) { const a = -0.5 + i / 72 * TAU; dotC(c, cx + Math.cos(a) * R, cy + Math.sin(a) * R, i === 0 ? 7 : 4, i === 0 ? CARD.blue : CARD.gold); }
+    for (let i = 0; i < 60; i++) { const a = -0.5 + i / 60 * TAU; dotC(c, cx + Math.cos(a) * R * 0.88, cy + Math.sin(a) * R * 0.88, 2.4, CARD.gold); }
+    for (let k = 0; k < 6; k++) { const a = -0.5 + k / 6 * TAU; for (let t = 0.12; t < 0.86; t += 0.055) dotC(c, cx + Math.cos(a) * R * t, cy + Math.sin(a) * R * t, 2.6, CARD.dim); }
+    dotC(c, cx, cy, R * 0.06, CARD.white);
+    for (const sg of [-1, 1]) for (let t = 0; t <= 1; t += 0.06) dotC(c, cx + sg * R * 0.55 * t, cy + R * 1.12 * t, 3, CARD.dim);
+    if (running) { const cell = R * 0.05; spriteC(c, RUN[0], cx - 8 * cell, cy + R * 0.86 - 10 * cell, cell); }
+    else { const cell = R * 0.035; spriteC(c, SLEEP, cx + R * 0.62, cy + R * 1.12 - 9 * cell, cell); spriteC(c, Z, cx + R * 0.62 + 12 * cell, cy + R * 1.12 - 16 * cell, cell); }
+    c.textAlign = "center"; c.fillStyle = running ? CARD.green : CARD.gray; c.font = '500 20px "IBM Plex Mono"';
+    c.fillText(running ? `HE'S RUNNING, ×${fmt(boost, 1)} BOOST` : "HE'S ASLEEP, NIGHT SHIFT", cx, 560);
+
+    // footer
+    c.textAlign = "left"; c.fillStyle = CARD.white; c.font = '500 20px "IBM Plex Mono"';
+    c.fillText("t.me/squeektoshigame", 98, 606);
+    c.textAlign = "right"; c.fillStyle = CARD.dim; c.font = '400 16px "IBM Plex Mono"';
+    c.fillText("Community game on Squeekchain's public data. Not affiliated.", W - 76, 606);
+    return cv;
+  }
+  let cardBusy = false;
+  $("cardBtn").addEventListener("click", async () => {
+    if (cardBusy) return; cardBusy = true; $("cardBtn").textContent = "Drawing your card…";
+    try {
+      await flush();
+      const cv = await drawCard();
+      const blob = await new Promise((res) => cv.toBlob(res, "image/png"));
+      if (initData || devUser) {
+        const r = await api.card(blob);
+        if (r.status === 200 && r.body.sent) toast("Sent to your chat with the bot. Forward it or post it on X.");
+        else if (r.body.reason === "start_bot") toast("Press Start in the chat with the bot, then try again.");
+        else if (r.status === 429) toast("One card every 30 seconds. Try again in a moment.");
+        else throw new Error("send failed");
+      } else {
+        const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "squeektoshi-card.png"; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      }
+    } catch (_) { toast("Couldn't make the card right now. Try again."); }
+    finally { cardBusy = false; $("cardBtn").textContent = "Get my card"; }
+  });
+  window.__drawCard = drawCard; // for local visual checks
 
   // ================================================================ the wheel (dot-matrix, canvas)
   const canvas = $("wheel"), ctx = canvas.getContext("2d");

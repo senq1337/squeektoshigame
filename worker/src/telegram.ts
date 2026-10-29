@@ -149,6 +149,51 @@ export function sendPhoto(
   });
 }
 
+/** Upload an image (e.g. a generated card) straight to a chat, multipart. Never throws. */
+export async function sendPhotoBytes(
+  token: string,
+  chatId: string | number,
+  bytes: ArrayBuffer,
+  filename: string,
+  caption: string,
+  buttons?: InlineButton[][],
+): Promise<{ ok?: boolean; error_code?: number; description?: string } | null> {
+  try {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    form.append("photo", new Blob([bytes], { type: "image/png" }), filename);
+    form.append("caption", caption);
+    form.append("parse_mode", "HTML");
+    if (buttons) form.append("reply_markup", JSON.stringify({ inline_keyboard: buttons }));
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form });
+    return (await res.json()) as { ok?: boolean; error_code?: number; description?: string };
+  } catch (e) {
+    console.error("telegram sendPhoto (upload) error", e);
+    return null;
+  }
+}
+
+/**
+ * The user's current profile photo as bytes (or null if hidden/none).
+ * Downloaded server-side because Telegram file URLs contain the bot token.
+ */
+export async function userPhoto(token: string, userId: number): Promise<ArrayBuffer | null> {
+  const photos = (await tgCall(token, "getUserProfilePhotos", { user_id: userId, limit: 1 })) as any;
+  const sizes: { file_id: string; width: number }[] | undefined = photos?.result?.photos?.[0];
+  if (!sizes?.length) return null;
+  // Smallest size that's still >= 320 px wide, else the largest available.
+  const pick = [...sizes].sort((a, b) => a.width - b.width).find((s) => s.width >= 320) ?? sizes[sizes.length - 1];
+  const file = (await tgCall(token, "getFile", { file_id: pick.file_id })) as any;
+  const path: string | undefined = file?.result?.file_path;
+  if (!path) return null;
+  try {
+    const res = await fetch(`https://api.telegram.org/file/bot${token}/${path}`);
+    return res.ok ? await res.arrayBuffer() : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Escape user-controlled text (names) for parse_mode=HTML. */
 export const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
