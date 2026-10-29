@@ -8,7 +8,9 @@ Telegram mini-app для экосистемы [Squeekchain](https://squeekchain.
 - Рефералка: личная ссылка `t.me/<бот>?start=r<id>`; пригласивший получает +10% от всех очков друга (очки идут только с реальных спинов с тем же лимитом скорости, так что пустые акки ничего не дают).
 - Будильник (по желанию игрока): бот пишет в личку, когда Squeektoshi начинает бегать, не чаще раза в 3 часа. Включается кнопкой в `/start`, командой `/alerts` или переключателем в аппе.
 - Личная карточка 1200×675: аватар и ник из Telegram, спины, очки, место, счёт «люди vs хомяк». Кнопка «Get my card» — бот присылает картинку в личку.
-- Бот: `/start` (картинка + кнопки «Spin», «Invite friends», «Top», «Ping me»), `/top`, `/hamster`, `/invite`, `/alerts`; по желанию алерты «проснулся / уснул» в канал и утренний итог дня.
+- Кошелёк: игрок оставляет EVM-адрес в аппе или командой `/wallet 0x...`. Проверка формата и EIP-55 чексуммы (опечатку в регистре ловит), один кошелёк на одного игрока. В аппе написано прямо: награды не обещаны.
+- Выгрузка для команды: админ пишет боту `/export [all|week|today] [N]` и получает CSV топа с кошельками и подсказками для ревью (см. ниже).
+- Бот: `/start` (картинка + кнопки «Spin», «Invite friends», «Top», «Ping me»), `/top`, `/hamster`, `/invite`, `/alerts`, `/wallet`; по желанию алерты «проснулся / уснул» в канал и утренний итог дня.
 
 Данные о хомяке берутся из публичного фида `https://api.squeekchain.com/v1/status` (статус колеса ACTIVE/IDLE, rpm, счётчик работы). Реальные блоки и SQK игра не минтит: это игра поверх их данных, а не часть протокола.
 
@@ -27,6 +29,7 @@ worker/
   src/hamster.ts    чтение и нормализация /v1/status, кэш 10 с, фолбэк
   src/migrate.ts    миграции базы, применяются воркером сами
   src/telegram.ts   проверка подписи Telegram initData, отправка сообщений
+  src/wallet.ts     проверка EVM-адреса (EIP-55), CSV-выгрузка топа с флагами
   schema.sql        таблицы D1
   test/             юнит-тесты (vitest) + интеграционный прогон против локального worker
 ```
@@ -40,6 +43,7 @@ worker/
 | POST | `/api/notify` | `{on}` — включить/выключить будильник |
 | GET | `/api/avatar` | моё фото из Telegram (через воркер: ссылки на файлы содержат токен) |
 | POST | `/api/card` | PNG моей карточки → бот присылает её мне в личку |
+| POST | `/api/wallet` | `{address}` (или `null`, чтобы удалить) → сохранённый кошелёк |
 | GET | `/api/leaderboard?scope=today\|all` | топ-20 + моё место |
 | POST | `/tg/webhook` | апдейты бота |
 
@@ -83,7 +87,20 @@ node -e "console.log(require('crypto').randomBytes(24).toString('hex'))" | npx w
 - **Алерты и итог дня:** создай канал, добавь бота админом, впиши id канала (`-100...`) в `ALERT_CHAT_ID` в `wrangler.jsonc`, `npx wrangler deploy`.
 - **Ссылка вида `t.me/<бот>/<app>`:** `/newapp` в BotFather, впиши в `APP_LINK`.
 
-Обновить после изменений в репо: `git pull`, затем `npx wrangler deploy` в папке `worker`.
+Обновить после изменений в репо (в папке `worker`): `git pull`, `npm install`, `npx wrangler deploy`.
+
+**Выгрузка топа (админ).**
+1. Напиши боту `/myid`, он ответит твоим Telegram id.
+2. `npx wrangler secret put ADMIN_IDS`: вставь id (несколько через запятую). Редеплой не нужен.
+3. `/export` (всё время, топ-100), `/export week 50`, `/export today`. Бот пришлёт CSV.
+
+Колонки: место, tg id, username, очки и спины за период, кошелёк, когда его поставили, кто пригласил, сколько пригласил, бонус с рефов, дней в игре, первый заход, флаги. Флаги — подсказки, ничего не вырезается автоматически:
+- `operator` — админ бота (билдер). Виден в списке, чтобы никто не сказал, что его спрятали.
+- `no_wallet` — нет кошелька.
+- `ref_heavy` — больше половины очков с рефов (типичная форма фермы альтов).
+- `inviter_in_top` — пригласивший тоже в этом списке.
+- `wallet_recent` — кошелёк поставлен или сменён меньше суток назад.
+- `one_day` — играл только один день.
 
 ## Лимиты бесплатного тарифа
 
@@ -103,7 +120,9 @@ cp wrangler.jsonc wrangler.local.jsonc   # и добавь в него:
 printf 'BOT_TOKEN=123456:TEST_TOKEN_not_real\nWEBHOOK_SECRET=testsecret\n' > .dev.vars
 npx wrangler d1 execute squeektoshi -c wrangler.local.jsonc --local --file=schema.sql
 npm test
-npx wrangler dev -c wrangler.local.jsonc --local --test-scheduled --var DEV_ALLOW_UNSIGNED:1
+npx wrangler dev -c wrangler.local.jsonc --local --test-scheduled --var DEV_ALLOW_UNSIGNED:1 --var ADMIN_IDS:7
+# интеграционный прогон: мок-фид на :8799 и --var STATUS_URL:http://127.0.0.1:8799/v1/status, затем
+#   node test/integration.mjs http://127.0.0.1:8787 http://127.0.0.1:8799
 # мини-апп без Telegram: http://127.0.0.1:8787/?dev=1&user=5
 ```
 

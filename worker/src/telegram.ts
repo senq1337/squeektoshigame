@@ -149,29 +149,48 @@ export function sendPhoto(
   });
 }
 
-/** Upload an image (e.g. a generated card) straight to a chat, multipart. Never throws. */
-export async function sendPhotoBytes(
+type TgResult = { ok?: boolean; error_code?: number; description?: string } | null;
+
+/** Multipart upload of one file (sendPhoto / sendDocument). Never throws. */
+async function uploadFile(
+  token: string,
+  method: "sendPhoto" | "sendDocument",
+  field: "photo" | "document",
+  chatId: string | number,
+  bytes: ArrayBuffer | Uint8Array,
+  filename: string,
+  mime: string,
+  caption: string,
+  buttons?: InlineButton[][],
+): Promise<TgResult> {
+  try {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    form.append(field, new Blob([bytes], { type: mime }), filename);
+    form.append("caption", caption);
+    form.append("parse_mode", "HTML");
+    if (buttons) form.append("reply_markup", JSON.stringify({ inline_keyboard: buttons }));
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: "POST", body: form });
+    return (await res.json()) as TgResult;
+  } catch (e) {
+    console.error(`telegram ${method} (upload) error`, e);
+    return null;
+  }
+}
+
+/** Upload an image (e.g. a generated card) straight to a chat. */
+export const sendPhotoBytes = (
   token: string,
   chatId: string | number,
   bytes: ArrayBuffer,
   filename: string,
   caption: string,
   buttons?: InlineButton[][],
-): Promise<{ ok?: boolean; error_code?: number; description?: string } | null> {
-  try {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    form.append("photo", new Blob([bytes], { type: "image/png" }), filename);
-    form.append("caption", caption);
-    form.append("parse_mode", "HTML");
-    if (buttons) form.append("reply_markup", JSON.stringify({ inline_keyboard: buttons }));
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form });
-    return (await res.json()) as { ok?: boolean; error_code?: number; description?: string };
-  } catch (e) {
-    console.error("telegram sendPhoto (upload) error", e);
-    return null;
-  }
-}
+) => uploadFile(token, "sendPhoto", "photo", chatId, bytes, filename, "image/png", caption, buttons);
+
+/** Send a text file (e.g. a CSV export) as a document. */
+export const sendDocumentText = (token: string, chatId: string | number, text: string, filename: string, mime: string, caption: string) =>
+  uploadFile(token, "sendDocument", "document", chatId, new TextEncoder().encode(text), filename, mime, caption);
 
 /**
  * The user's current profile photo as bytes (or null if hidden/none).

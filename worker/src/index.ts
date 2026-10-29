@@ -10,8 +10,10 @@
 //   POST /api/notify                { on } -> opt in/out of "he's running" pings
 //   GET  /api/avatar                my Telegram profile photo (proxied: file URLs contain the token)
 //   POST /api/card                  PNG bytes of my card -> the bot sends it to my private chat
+//   POST /api/wallet                { address } (EVM, or null to remove) -> my saved wallet
 //   GET  /api/leaderboard?scope=today|all
-//   POST /tg/webhook                Telegram bot updates (/start [r<id>], /top, /hamster, /invite, buttons)
+//   POST /tg/webhook                Telegram bot updates (/start [r<id>], /top, /hamster, /invite, /wallet,
+//                                   buttons; admins: /export [all|week|today] [N] -> CSV of the top)
 // Referrals: t.me/<bot>?start=r<id> (or a Mini App link with startapp=r<id>) marks the new player
 // as invited by <id>; the inviter then earns REF_BONUS_PCT% of every point the friend earns.
 // The schema migrates itself (src/migrate.ts).
@@ -42,6 +44,7 @@ import {
   esc,
   sendMessage,
   sendPhoto,
+  sendDocumentText,
   sendPhotoBytes,
   tgCall,
   userPhoto,
@@ -49,6 +52,7 @@ import {
   type InlineButton,
   type TgUser,
 } from "./telegram";
+import { checkAddress, parseN, parseScope, shortAddr, toChecksum, toCsv, type ExportRow, type ExportScope } from "./wallet";
 
 export interface Env {
   DB: D1Database;
@@ -58,6 +62,7 @@ export interface Env {
   ALERT_CHAT_ID: string;
   DEV_ALLOW_UNSIGNED: string;
   APP_LINK?: string; // optional t.me/<bot>/<app> link for buttons in channels
+  ADMIN_IDS?: string; // secret or var: comma-separated Telegram ids allowed to /export
   BOT_TOKEN: string; // secret
   WEBHOOK_SECRET: string; // secret
 }
@@ -116,7 +121,7 @@ const spinButton = (env: Env, appUrl: string, text = "🐹 Spin the wheel"): Inl
 // ---------------------------------------------------------------- one-time bot setup
 
 /** Bump to re-run setup after changing commands/texts. */
-const SETUP_VERSION = 3;
+const SETUP_VERSION = 4;
 const BOT_NAME = "Squeektoshi Game";
 
 interface SetupState {
@@ -183,6 +188,7 @@ export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
         { command: "top", description: "Today's top spinners" },
         { command: "invite", description: "Your invite link (+10% of friends' points)" },
         { command: "alerts", description: "Ping me when Squeektoshi runs (on/off)" },
+        { command: "wallet", description: "Add or change your EVM wallet" },
       ],
     }),
     tgCall(t, "setMyShortDescription", {
@@ -350,6 +356,91 @@ async function handleCard(req: Request, env: Env): Promise<Response> {
   return json(env, { sent: false, reason: "telegram" }, 502);
 }
 
+// ---------------------------------------------------------------- wallet
+
+type WalletResult = { ok: true; wallet: string | null } | { ok: false; error: "format" | "checksum" | "zero" | "taken" };
+
+/** Save (or with null/"" remove) the player's EVM wallet. One wallet per player, one player per wallet. */
+async function setWallet(
+  env: Env,
+  u: { id: number; username?: string; first_name?: string },
+  input: unknown,
+  now: number,
+): Promise<WalletResult> {
+  await env.DB.prepare("INSERT OR IGNORE INTO players (id, username, first_name, created_at) VALUES (?, ?, ?, ?)")
+    .bind(u.id, u.username ?? null, u.first_name ?? null, now)
+    .run();
+  if (input === null || input === "") {
+    await env.DB.prepare("UPDATE players SET wallet = NULL, wallet_at = ? WHERE id = ?").bind(now, u.id).run();
+    return { ok: true, wallet: null };
+  }
+  const c = checkAddress(input);
+  if (!c.ok) return { ok: false, error: c.reason };
+  const cur = await env.DB.prepare("SELECT wallet FROM players WHERE id = ?").bind(u.id).first<{ wallet: string | null }>();
+  if (cur?.wallet === c.lower) return { ok: true, wallet: c.checksummed }; // unchanged: keep wallet_at
+  try {
+    await env.DB.prepare("UPDATE players SET wallet = ?, wallet_at = ? WHERE id = ?").bind(c.lower, now, u.id).run();
+  } catch (e) {
+    if (/UNIQUE/i.test(String(e))) return { ok: false, error: "taken" };
+    throw e;
+  }
+  return { ok: true, wallet: c.checksummed };
+}
+
+const WALLET_ERRORS: Record<string, string> = {
+  format: "That's not an EVM address. It should be 0x followed by 40 characters (0-9, a-f).",
+  checksum: "The capital letters don't match the address checksum, so there's probably a typo. Copy it from your wallet again.",
+  zero: "That's the zero address. Paste your own wallet.",
+  taken: "This wallet is already linked to another player.",
+};
+
+async function handleWallet(req: Request, env: Env): Promise<Response> {
+  const user = await authUser(req, env);
+  if (!user) return json(env, { error: "unauthorized" }, 401);
+  const body = (await req.json().catch(() => null)) as { address?: unknown } | null;
+  if (!body || !("address" in body)) return json(env, { error: "bad_json" }, 400);
+  const r = await setWallet(env, user, body.address, Date.now());
+  if (!r.ok) return json(env, { error: r.error, message: WALLET_ERRORS[r.error] }, r.error === "taken" ? 409 : 400);
+  return json(env, { wallet: r.wallet });
+}
+
+// ---------------------------------------------------------------- export (admins)
+
+const adminIds = (env: Env) =>
+  new Set(
+    (env.ADMIN_IDS ?? "")
+      .split(/[,\s]+/)
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n > 0),
+  );
+
+/** Top-N for a window, with what a reviewer needs to judge each row (see wallet.ts exportFlags). */
+async function exportRows(env: Env, scope: ExportScope, n: number, now: number): Promise<ExportRow[]> {
+  const extra =
+    "p.id, p.username, p.first_name, p.total_points AS all_points, p.ref_points, p.wallet, p.wallet_at, p.ref_by, p.created_at, " +
+    "(SELECT COUNT(*) FROM players f WHERE f.ref_by = p.id) AS invites, " +
+    "(SELECT COUNT(*) FROM players f WHERE f.ref_by = p.id AND f.total_revs > 0) AS active_invites, " +
+    "(SELECT COUNT(*) FROM daily dd WHERE dd.player_id = p.id AND dd.revs > 0) AS days_played";
+  if (scope === "all") {
+    const r = await env.DB.prepare(
+      `SELECT ${extra}, p.total_points AS points, p.total_revs AS revs FROM players p ` +
+        "WHERE p.total_points > 0 ORDER BY p.total_points DESC, p.id LIMIT ?",
+    )
+      .bind(n)
+      .all<ExportRow>();
+    return r.results;
+  }
+  const since = utcDay(scope === "week" ? now - 6 * 86400_000 : now); // week = today + 6 previous UTC days
+  const r = await env.DB.prepare(
+    `SELECT ${extra}, s.points, s.revs FROM ` +
+      "(SELECT player_id, SUM(points) AS points, SUM(revs) AS revs FROM daily WHERE day >= ? GROUP BY player_id) s " +
+      "JOIN players p ON p.id = s.player_id WHERE s.points > 0 ORDER BY s.points DESC, p.id LIMIT ?",
+  )
+    .bind(since, n)
+    .all<ExportRow>();
+  return r.results;
+}
+
 // ---------------------------------------------------------------- API handlers
 
 /** Everything the app shows about the current player, in one call (used on open). */
@@ -359,9 +450,9 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
   const day = utcDay(Date.now());
   const db = env.DB;
   const [p, d, friends, username] = await Promise.all([
-    db.prepare("SELECT total_revs, total_points, ref_points, notify, chat_ok FROM players WHERE id = ?")
+    db.prepare("SELECT total_revs, total_points, ref_points, notify, chat_ok, wallet FROM players WHERE id = ?")
       .bind(user.id)
-      .first<{ total_revs: number; total_points: number; ref_points: number; notify: number; chat_ok: number }>(),
+      .first<{ total_revs: number; total_points: number; ref_points: number; notify: number; chat_ok: number; wallet: string | null }>(),
     db.prepare("SELECT revs, points FROM daily WHERE day = ? AND player_id = ?")
       .bind(day, user.id)
       .first<{ revs: number; points: number }>(),
@@ -378,6 +469,7 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
     invites: { friends: friends?.n ?? 0, active: friends?.active ?? 0, bonusPoints: p?.ref_points ?? 0, pct: REF_BONUS_PCT },
     inviteLink: inviteLink(env, username, user.id),
     alerts: { on: p?.notify === 1, chatOk: p ? p.chat_ok === 1 : false },
+    wallet: p?.wallet ? toChecksum(p.wallet) : null,
   });
 }
 
@@ -574,6 +666,26 @@ async function hamsterText(env: Env, now: number): Promise<string> {
   return `${line}\n\nToday: humans ${humanWork(g.human_revs).toFixed(2)} vs hamster ${g.hamster_work} work units`;
 }
 
+/** /wallet, /wallet 0x..., /wallet off */
+async function walletCommand(
+  env: Env,
+  from: { id: number; username?: string; first_name?: string },
+  arg: string | undefined,
+  now: number,
+): Promise<string> {
+  if (!arg) {
+    const p = await env.DB.prepare("SELECT wallet FROM players WHERE id = ?").bind(from.id).first<{ wallet: string | null }>();
+    return p?.wallet
+      ? `👛 Your wallet: <code>${toChecksum(p.wallet)}</code>\n\nChange: /wallet 0xNEW…\nRemove: /wallet off`
+      : "👛 No wallet yet. Send <code>/wallet 0xYourAddress</code> (any EVM wallet).\n\n" +
+          "<i>If the Squeekchain team ever rewards top spinners, this is where it goes. Nothing is promised.</i>";
+  }
+  const off = ["off", "remove", "delete", "none"].includes(arg.toLowerCase());
+  const r = await setWallet(env, from, off ? null : arg, now);
+  if (!r.ok) return `⚠️ ${WALLET_ERRORS[r.error]}`;
+  return r.wallet ? `✅ Wallet saved: <code>${r.wallet}</code> (${shortAddr(r.wallet)})` : "Wallet removed.";
+}
+
 async function handleWebhook(req: Request, env: Env): Promise<Response> {
   if (req.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
     return new Response("forbidden", { status: 403 });
@@ -604,7 +716,9 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
   const chatId = msg?.chat?.id;
   if (!chatId || !text.startsWith("/")) return new Response("ok");
 
-  const [cmdRaw, payload] = text.split(/\s+/, 2);
+  const args = text.trim().split(/\s+/);
+  const cmdRaw = args[0];
+  const payload: string | undefined = args[1];
   const cmd = cmdRaw.split("@")[0].toLowerCase();
   const isPrivate = msg.chat.type === "private";
   const from = msg.from as { id: number; username?: string; first_name?: string } | undefined;
@@ -662,6 +776,22 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
         [[{ text: "Share", url: shareUrl(myLink) }], [spin]],
       );
     }
+  } else if (cmd === "/wallet" && isPrivate && from) {
+    await sendMessage(t, chatId, await walletCommand(env, from, payload, now));
+  } else if (cmd === "/myid" && isPrivate && from) {
+    await sendMessage(t, chatId, `Your Telegram id: <code>${from.id}</code>`);
+  } else if (cmd === "/export" && isPrivate && from && adminIds(env).has(from.id)) {
+    const scope = parseScope(payload);
+    const n = parseN(args[2]);
+    const rows = await exportRows(env, scope, n, now);
+    const withWallet = rows.filter((r) => r.wallet).length;
+    const stamp = new Date(now).toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    const caption =
+      `📋 Top ${rows.length} by ${scope === "all" ? "all-time" : scope === "week" ? "last 7 days" : "today's"} points, ` +
+      `${withWallet} with a wallet. ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC\n\n` +
+      "Flags: operator · no_wallet · ref_heavy (>50% of points from invites) · inviter_in_top · wallet_recent (<24 h) · one_day";
+    const r = await sendDocumentText(t, chatId, toCsv(rows, { adminIds: adminIds(env), now }), `squeektoshi-top-${scope}-${stamp}.csv`, "text/csv", caption);
+    if (!r?.ok) await sendMessage(t, chatId, "Couldn't send the export. Try again in a minute.");
   }
   return new Response("ok");
 }
@@ -821,12 +951,20 @@ export default {
       if (pathname === "/api/notify" && req.method === "POST") return await handleNotify(req, env);
       if (pathname === "/api/avatar" && req.method === "GET") return await handleAvatar(req, env);
       if (pathname === "/api/card" && req.method === "POST") return await handleCard(req, env);
+      if (pathname === "/api/wallet" && req.method === "POST") return await handleWallet(req, env);
       if (pathname === "/api/leaderboard" && req.method === "GET") return await handleLeaderboard(req, env);
       if (pathname === "/tg/webhook" && req.method === "POST") return await handleWebhook(req, env);
       // Local testing only (DEV_ALLOW_UNSIGNED=1): run the recap job on demand.
       if (pathname === "/dev/recap" && env.DEV_ALLOW_UNSIGNED === "1") {
         await dailyRecap(env);
         return json(env, { ok: true });
+      }
+      // Local testing only: the same CSV that /export sends admins in Telegram.
+      if (pathname === "/dev/export" && env.DEV_ALLOW_UNSIGNED === "1") {
+        const q = new URL(req.url).searchParams;
+        const now = Date.now();
+        const rows = await exportRows(env, parseScope(q.get("scope") ?? undefined), parseN(q.get("n") ?? undefined), now);
+        return new Response(toCsv(rows, { adminIds: adminIds(env), now }), { headers: { "content-type": "text/csv" } });
       }
       // "/" is normally answered by the static mini-app; this only shows if assets are missing.
       if (pathname === "/") return new Response("squeektoshi worker ok");

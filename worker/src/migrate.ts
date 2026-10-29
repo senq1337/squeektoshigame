@@ -26,6 +26,12 @@ export const MIGRATIONS: string[][] = [
     "ALTER TABLE players ADD COLUMN last_card_at INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS players_notify ON players (notify, id)",
   ],
+  // 4: EVM wallet per player (lowercase 0x...), one player per wallet
+  [
+    "ALTER TABLE players ADD COLUMN wallet TEXT",
+    "ALTER TABLE players ADD COLUMN wallet_at INTEGER NOT NULL DEFAULT 0",
+    "CREATE UNIQUE INDEX IF NOT EXISTS players_wallet ON players (wallet) WHERE wallet IS NOT NULL",
+  ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

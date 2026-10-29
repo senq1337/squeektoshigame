@@ -178,6 +178,41 @@ const av = await fetch(`${API}/api/avatar?dev_user=7`);
 assert.equal(av.status, 404);
 step("card: PNG accepted (send fails offline), 30 s cooldown, non-PNG rejected; avatar 404 without Telegram");
 
+// 14. Wallet: checksum check, one player per wallet, bot command, admin export
+//     (run wrangler dev with --var ADMIN_IDS:7 so player 7 shows up as the operator)
+const W = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+const W2 = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359";
+const setW = async (u, address) => {
+  const res = await fetch(`${API}/api/wallet?dev_user=${u}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ address }) });
+  return { status: res.status, body: await res.json() };
+};
+let wr = await setW(7, W.toLowerCase());
+assert.equal(wr.status, 200);
+assert.equal(wr.body.wallet, W);
+assert.equal((await setW(7, W.slice(0, -1) + "D")).body.error, "checksum");
+assert.equal((await setW(7, "0x123")).status, 400);
+wr = await setW(501, W);
+assert.equal(wr.status, 409);
+assert.equal(wr.body.error, "taken");
+assert.equal((await (await fetch(`${API}/api/me?dev_user=7`)).json()).wallet, W);
+step("wallet: saved checksummed, typo and junk rejected, same wallet can't go on a second player");
+
+await hook({ text: `/wallet ${W2}`, chat: { id: 501, type: "private" }, from: { id: 501 } });
+assert.equal((await (await fetch(`${API}/api/me?dev_user=501`)).json()).wallet, W2);
+await hook({ text: "/wallet off", chat: { id: 501, type: "private" }, from: { id: 501 } });
+assert.equal((await (await fetch(`${API}/api/me?dev_user=501`)).json()).wallet, null);
+step("/wallet 0x... and /wallet off work from the bot chat");
+
+const csv = (await (await fetch(`${API}/dev/export?scope=all&n=10`)).text()).trim().split("\n");
+assert.ok(csv[0].startsWith("rank,tg_id,username"));
+const row7 = csv.find((l) => l.split(",")[1] === "7");
+const row501 = csv.find((l) => l.split(",")[1] === "501");
+assert.ok(row7.includes(W) && row7.includes("operator") && row7.includes("wallet_recent"), row7);
+assert.ok(row501.includes("no_wallet") && row501.includes("inviter_in_top"), row501);
+const week = (await (await fetch(`${API}/dev/export?scope=week`)).text()).trim().split("\n");
+assert.equal(week.length, csv.length);
+step(`export: ${csv.length - 1} rows, operator and alt-shaped rows flagged`);
+
 // 10. Recap job runs without crashing (no row for yesterday -> no-op)
 const rc = await fetch(`${API}/dev/recap`);
 assert.equal(rc.status, 200);
