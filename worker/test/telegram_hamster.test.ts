@@ -30,9 +30,12 @@ describe("verifyInitData", () => {
     expect(await verifyInitData(init, TOKEN, NOW_S + INIT_DATA_MAX_AGE_S + 1)).toBeNull();
   });
 
-  it("ignores the extra signature field newer clients send", async () => {
-    const init = await signInitData(fields(), TOKEN);
-    expect(await verifyInitData(init + "&signature=abc", TOKEN, NOW_S)).not.toBeNull();
+  it("includes the signature field newer clients send in the HMAC check", async () => {
+    // Real clients sign signature together with the other fields (only hash is excluded).
+    const init = await signInitData({ ...fields(), signature: "c2lnbmF0dXJl" }, TOKEN);
+    expect(await verifyInitData(init, TOKEN, NOW_S)).not.toBeNull();
+    // Tampering with signature breaks the hash.
+    expect(await verifyInitData(init.replace("signature=c2lnbmF0dXJl", "signature=eHh4"), TOKEN, NOW_S)).toBeNull();
   });
 });
 

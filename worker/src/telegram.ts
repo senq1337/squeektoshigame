@@ -45,8 +45,9 @@ export async function verifyInitData(
   const params = new URLSearchParams(initData);
   const hash = params.get("hash");
   if (!hash) return null;
+  // Only `hash` is excluded. Newer clients also send `signature` (Ed25519, for third-party
+  // validation); for this bot-token HMAC check it stays IN the data-check-string.
   params.delete("hash");
-  params.delete("signature"); // newer clients add an Ed25519 signature; not part of the HMAC check
   const dataCheck = [...params.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([k, v]) => `${k}=${v}`)

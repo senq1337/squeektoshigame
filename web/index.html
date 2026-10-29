@@ -386,7 +386,7 @@
         if (b.capped) toast("That burst was faster than a wheel can turn, so only part of it counted.");
         if (!myRank) loadBoard();
       } else if (r.status === 401) {
-        toast("Open the wheel from the Telegram bot so your spins are saved.");
+        toast("Couldn't verify your Telegram login. Close the wheel and open it again from the bot.");
       } else { pending += revs; }
     } catch (_) { pending += revs; } finally { inFlight = false; }
   }
