@@ -9,8 +9,8 @@ const MOCK = process.argv[3] ?? "http://127.0.0.1:8799";
 const TOKEN = "123456:TEST_TOKEN_not_real"; // same as .dev.vars
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function initData(user) {
-  const fields = { auth_date: String(Math.floor(Date.now() / 1000)), query_id: "AAE", user: JSON.stringify(user) };
+function initData(user, extra = {}) {
+  const fields = { auth_date: String(Math.floor(Date.now() / 1000)), query_id: "AAE", user: JSON.stringify(user), ...extra };
   const dcs = Object.keys(fields).sort().map((k) => `${k}=${fields[k]}`).join("\n");
   const secret = createHmac("sha256", "WebAppData").update(TOKEN).digest();
   const hash = createHmac("sha256", secret).update(dcs).digest("hex");
@@ -112,6 +112,40 @@ w = await fetch(`${API}/tg/webhook`, {
 });
 assert.equal(w.status, 200);
 step("webhook: wrong secret 403, /top handled 200");
+
+// 11. Referrals (also exercises the automatic v2 schema migration)
+const hook = (message) => fetch(`${API}/tg/webhook`, {
+  method: "POST",
+  headers: { "x-telegram-bot-api-secret-token": "testsecret", "content-type": "application/json" },
+  body: JSON.stringify({ message }),
+});
+assert.equal((await hook({ text: "/start r7", chat: { id: 501, type: "private" }, from: { id: 501, username: "friend1" } })).status, 200);
+r = await spin({ revs: 20, seq: 1 }, { devUser: 501 });
+assert.equal(r.status, 200);
+const friendPts = r.body.me.today_points;
+const me7 = await (await fetch(`${API}/api/me?dev_user=7`)).json();
+assert.equal(me7.invites.friends, 1);
+assert.equal(me7.invites.active, 1);
+assert.equal(me7.invites.bonusPoints, Math.floor(friendPts / 10));
+assert.equal(me7.today.points, 30 + Math.floor(friendPts / 10));
+step(`/start r7 -> friend spun ${friendPts} pts, inviter got +${me7.invites.bonusPoints} (10%)`);
+
+// self-invite and re-inviting someone who already spun are ignored
+await hook({ text: "/start r502", chat: { id: 502, type: "private" }, from: { id: 502 } });
+await hook({ text: "/start r42", chat: { id: 501, type: "private" }, from: { id: 501 } });
+const me502 = await (await fetch(`${API}/api/me?dev_user=502`)).json();
+assert.equal(me502.invites.friends, 0);
+let me42 = await (await fetch(`${API}/api/me`, { headers: { "x-init-data": initData(user) } })).json();
+assert.equal(me42.invites.friends, 0);
+step("self-invite ignored; a friend who already spun can't be re-invited");
+
+// Mini App deep link: startapp=r42 arrives as start_param in signed initData
+const newbie = { id: 777, first_name: "New" };
+r = await spin({ revs: 10, seq: 1 }, { init: initData(newbie, { start_param: "r42" }) });
+assert.equal(r.status, 200);
+me42 = await (await fetch(`${API}/api/me`, { headers: { "x-init-data": initData(user) } })).json();
+assert.equal(me42.invites.friends, 1);
+step("startapp=r42 in initData registers the referral on first spin");
 
 // 10. Recap job runs without crashing (no row for yesterday -> no-op)
 const rc = await fetch(`${API}/dev/recap`);

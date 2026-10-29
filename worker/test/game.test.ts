@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   acceptBatch,
+  parseRef,
+  refBonus,
   boostMilli,
   FIRST_BATCH_WINDOW_MS,
   hamsterDelta,
@@ -110,5 +112,20 @@ describe("stepWake", () => {
   it("changes nothing without a signal", () => {
     const r = stepWake(asleep, null, T0 + 60_000);
     expect(r).toEqual({ next: asleep, event: null });
+  });
+});
+
+describe("referrals", () => {
+  it("parses r<id> payloads only", () => {
+    expect(parseRef("r123456")).toBe(123456);
+    expect(parseRef("123")).toBeNull();
+    expect(parseRef("r0")).toBeNull();
+    expect(parseRef("r12x")).toBeNull();
+    expect(parseRef(undefined)).toBeNull();
+  });
+  it("gives the inviter 10%, floored", () => {
+    expect(refBonus(100)).toBe(10);
+    expect(refBonus(9)).toBe(0);
+    expect(refBonus(31)).toBe(3);
   });
 });

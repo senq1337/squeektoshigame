@@ -72,6 +72,23 @@ export function humanWork(revs: number): number {
   return revs / HUMAN_REVS_PER_HAMSTER_WORK;
 }
 
+// ---- Referrals -------------------------------------------------------------
+
+/** The inviter earns this % of every point their friend earns (from real, speed-capped spins). */
+export const REF_BONUS_PCT = 10;
+
+export function refBonus(points: number): number {
+  return Math.floor((points * REF_BONUS_PCT) / 100);
+}
+
+/** "r123456" -> 123456 (a referral payload from /start or startapp), else null. */
+export function parseRef(payload: string | null | undefined): number | null {
+  const m = /^r(\d{1,15})$/.exec(payload ?? "");
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
 export function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }

@@ -5,7 +5,8 @@ Telegram mini-app для экосистемы [Squeekchain](https://squeekchain.
 - **Хомяк бежит** → его живые обороты бустят каждый спин игроков (×1 … ×7, `1 + rpm/20`).
 - **Хомяк спит** → ночная смена: люди крутят колесо сами, но **1000 человеческих спинов = 1 хомячий оборот**.
 - Каждый день счёт **«люди vs хомяк»**, лидерборд за день и за всё время, кнопки «поделиться» в Telegram и X.
-- Бот: `/start`, `/top`, `/hamster`; по желанию алерты «проснулся / уснул» в канал и утренний итог дня.
+- Рефералка: личная ссылка `t.me/<бот>?start=r<id>`; пригласивший получает +10% от всех очков друга (очки идут только с реальных спинов с тем же лимитом скорости, так что пустые акки ничего не дают).
+- Бот: `/start` (картинка + кнопки «Spin», «Invite friends», «Top»), `/top`, `/hamster`, `/invite`; по желанию алерты «проснулся / уснул» в канал и утренний итог дня.
 
 Данные о хомяке берутся из публичного фида `https://api.squeekchain.com/v1/status` (статус колеса ACTIVE/IDLE, rpm, счётчик работы). Реальные блоки и SQK игра не минтит: это игра поверх их данных, а не часть протокола.
 
@@ -22,6 +23,7 @@ worker/
   src/index.ts      роуты API, бот, cron, авто-настройка бота
   src/game.ts       правила: анти-чит, буст, детектор "проснулся/уснул" (чистые функции)
   src/hamster.ts    чтение и нормализация /v1/status, кэш 10 с, фолбэк
+  src/migrate.ts    миграции базы, применяются воркером сами
   src/telegram.ts   проверка подписи Telegram initData, отправка сообщений
   schema.sql        таблицы D1
   test/             юнит-тесты (vitest) + интеграционный прогон против локального worker
@@ -32,6 +34,7 @@ worker/
 | GET | `/` | мини-апп |
 | GET | `/api/state` | статус хомяка, текущий буст, счёт «люди vs хомяк» за сегодня |
 | POST | `/api/spin` | `{revs, seq}` + заголовок `X-Init-Data` → засчитанные обороты, мои очки |
+| GET | `/api/me` | мой день, итоги, друзья, моя инвайт-ссылка |
 | GET | `/api/leaderboard?scope=today\|all` | топ-20 + моё место |
 | POST | `/tg/webhook` | апдейты бота |
 
@@ -54,19 +57,22 @@ cd squeektoshigame\worker
 npm install
 npx wrangler login
 npx wrangler d1 create squeektoshi --binding DB --update-config
-npx wrangler d1 execute squeektoshi --remote --file=schema.sql
 npx wrangler deploy
 npx wrangler secret put BOT_TOKEN
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))" | npx wrangler secret put WEBHOOK_SECRET
 ```
 
 - `wrangler login` открывает браузер: войди в нужный аккаунт Cloudflare и нажми Allow.
-- `d1 create ... --update-config` сам допишет базу в `wrangler.jsonc`.
+- `d1 create ... --update-config` сам допишет базу в `wrangler.jsonc`. Таблицы воркер создаёт и обновляет сам (src/migrate.ts).
 - Первый `wrangler deploy` попросит выбрать поддомен `*.workers.dev` и в конце напечатает адрес приложения.
 - `secret put BOT_TOKEN` спросит значение: вставь токен из BotFather. Токен не попадает ни в файлы, ни в git.
 - Последняя команда сама генерирует случайный секрет вебхука.
 
 Потом **открой адрес приложения в браузере один раз** (`https://squeektoshi.<поддомен>.workers.dev`). В течение минуты бот настроит себя. Дальше в Telegram: бот → `/start` → кнопка Spin.
+
+Аватар и картинка до старта (через API боту их не поставить, только руками):
+- BotFather → `/mybots` → бот → Edit Bot → Edit Botpic → `art/avatar.png`.
+- BotFather → `/mybots` → бот → Edit Bot → Edit Description Picture → `art/welcome_640x360.png`.
 
 По желанию:
 - **Алерты и итог дня:** создай канал, добавь бота админом, впиши id канала (`-100...`) в `ALERT_CHAT_ID` в `wrangler.jsonc`, `npx wrangler deploy`.

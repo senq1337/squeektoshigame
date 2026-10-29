@@ -6,8 +6,12 @@
 //   GET  /api/state                 live hamster + today's humans-vs-hamster score
 //                                   (also sets the bot up on first call: webhook, menu button)
 //   POST /api/spin                  { revs, seq } + header X-Init-Data  -> accepted revs, my stats
+//   GET  /api/me                    my day, totals, friends invited, my invite link (X-Init-Data)
 //   GET  /api/leaderboard?scope=today|all
-//   POST /tg/webhook                Telegram bot updates (/start, /top, /hamster)
+//   POST /tg/webhook                Telegram bot updates (/start [r<id>], /top, /hamster, /invite, buttons)
+// Referrals: t.me/<bot>?start=r<id> (or a Mini App link with startapp=r<id>) marks the new player
+// as invited by <id>; the inviter then earns REF_BONUS_PCT% of every point the friend earns.
+// The schema migrates itself (src/migrate.ts).
 // Cron:
 //   every minute  poll hamster, count hamster work for the day, wake/sleep alerts;
 //                 06:00–06:30 UTC also (re)tries yesterday's recap until it's delivered
@@ -17,13 +21,25 @@ import {
   boostMilli,
   hamsterDelta,
   humanWork,
+  parseRef,
   pointsFor,
+  refBonus,
+  REF_BONUS_PCT,
   stepWake,
   utcDay,
   type WakeMachine,
 } from "./game";
 import { getHamster, type HamsterState } from "./hamster";
-import { esc, sendMessage, tgCall, verifyInitData, type InlineButton, type TgUser } from "./telegram";
+import { ensureSchema } from "./migrate";
+import {
+  esc,
+  sendMessage,
+  sendPhoto,
+  tgCall,
+  verifyInitData,
+  type InlineButton,
+  type TgUser,
+} from "./telegram";
 
 export interface Env {
   DB: D1Database;
@@ -91,7 +107,28 @@ const spinButton = (env: Env, appUrl: string, text = "🐹 Spin the wheel"): Inl
 // ---------------------------------------------------------------- one-time bot setup
 
 /** Bump to re-run setup after changing commands/texts. */
-const SETUP_VERSION = 1;
+const SETUP_VERSION = 2;
+const BOT_NAME = "Squeektoshi Game";
+
+interface SetupState {
+  origin: string;
+  v: number;
+  username?: string; // the bot's @username, for invite links
+}
+
+async function botUsername(env: Env): Promise<string | null> {
+  return (await kvGet<SetupState>(env.DB, "bot_setup"))?.username ?? null;
+}
+
+/** Personal invite link: opens the Mini App directly if APP_LINK is set, else the bot chat. */
+function inviteLink(env: Env, username: string | null, userId: number): string | null {
+  if (env.APP_LINK) return `${env.APP_LINK}${env.APP_LINK.includes("?") ? "&" : "?"}startapp=r${userId}`;
+  return username ? `https://t.me/${username}?start=r${userId}` : null;
+}
+
+const INVITE_TEXT = `Spin the wheel with Squeektoshi, the hamster mining Squeekchain 🐹 When he runs, his rpm boosts your spins.`;
+const shareUrl = (link: string) =>
+  `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(INVITE_TEXT)}`;
 let lastSetupTry = 0;
 /** For tests. */
 export const _resetSetupThrottle = () => {
@@ -114,7 +151,7 @@ export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
   if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !origin.startsWith("https://")) return;
   const now = Date.now();
   if (now - lastSetupTry < 60_000) return; // at most once a minute per isolate
-  const done = await kvGet<{ origin: string; v: number }>(env.DB, "bot_setup");
+  const done = await kvGet<SetupState>(env.DB, "bot_setup");
   if (done && done.origin === origin && done.v === SETUP_VERSION) return;
   lastSetupTry = now;
 
@@ -124,15 +161,18 @@ export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
     tgCall(t, "setWebhook", {
       url: `${origin}/tg/webhook`,
       secret_token: env.WEBHOOK_SECRET,
-      allowed_updates: ["message"],
+      allowed_updates: ["message", "callback_query"],
       drop_pending_updates: true,
     }),
     tgCall(t, "setChatMenuButton", { menu_button: { type: "web_app", text: "Spin", web_app: { url } } }),
+    tgCall(t, "getMe", {}),
+    tgCall(t, "setMyName", { name: BOT_NAME }),
     tgCall(t, "setMyCommands", {
       commands: [
         { command: "start", description: "Open the wheel" },
         { command: "hamster", description: "Is Squeektoshi running right now?" },
         { command: "top", description: "Today's top spinners" },
+        { command: "invite", description: "Your invite link (+10% of friends' points)" },
       ],
     }),
     tgCall(t, "setMyShortDescription", {
@@ -144,11 +184,13 @@ export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
         "When he runs, his live rpm boosts your spins; when he sleeps, the humans take the night shift.\n\n" +
         "Community-built on Squeekchain's public data. Not affiliated with Squeekchain.",
     }),
-  ])) as ({ ok?: boolean } | null)[];
+  ])) as ({ ok?: boolean; result?: any } | null)[];
 
-  // Webhook and menu button are the ones that matter; the rest is cosmetic.
-  if (results[0]?.ok && results[1]?.ok) {
-    await kvPut(env.DB, "bot_setup", { origin, v: SETUP_VERSION }, now).run();
+  // Webhook, menu button and getMe (for invite links) are the ones that matter; the rest is cosmetic.
+  const username: string | undefined = results[2]?.result?.username;
+  if (results[0]?.ok && results[1]?.ok && username) {
+    const state: SetupState = { origin, v: SETUP_VERSION, username };
+    await kvPut(env.DB, "bot_setup", state, now).run();
   }
 }
 
@@ -188,7 +230,74 @@ function statePayload(h: HamsterState, g: GlobalRow, day: string) {
   };
 }
 
+// ---------------------------------------------------------------- referrals
+
+/**
+ * Mark `user` as invited by `refId`. Only for players who haven't spun yet and have no inviter,
+ * only if the inviter is a real player, never yourself, and no direct A<->B loop.
+ * Returns true if the referral was recorded.
+ */
+async function attachReferral(
+  env: Env,
+  user: { id: number; username?: string; first_name?: string },
+  refId: number | null,
+  now: number,
+): Promise<boolean> {
+  if (!refId || refId === user.id) return false;
+  const inviter = await env.DB.prepare("SELECT id, ref_by FROM players WHERE id = ?")
+    .bind(refId)
+    .first<{ id: number; ref_by: number | null }>();
+  if (!inviter || inviter.ref_by === user.id) return false;
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO players (id, username, first_name, created_at, ref_by) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(user.id, user.username ?? null, user.first_name ?? null, now, refId)
+    .run();
+  const upd = await env.DB.prepare(
+    "UPDATE players SET ref_by = ? WHERE id = ? AND (ref_by IS NULL OR ref_by = ?) AND total_revs = 0",
+  )
+    .bind(refId, user.id, refId)
+    .run();
+  return upd.meta.changes > 0;
+}
+
+async function rankFor(env: Env, scope: "today" | "all", day: string, points: number): Promise<number> {
+  const ahead =
+    scope === "all"
+      ? await env.DB.prepare("SELECT COUNT(*) AS n FROM players WHERE total_points > ?").bind(points).first<{ n: number }>()
+      : await env.DB.prepare("SELECT COUNT(*) AS n FROM daily WHERE day = ? AND points > ?").bind(day, points).first<{ n: number }>();
+  return (ahead?.n ?? 0) + 1;
+}
+
 // ---------------------------------------------------------------- API handlers
+
+/** Everything the app shows about the current player, in one call (used on open). */
+async function handleMe(req: Request, env: Env): Promise<Response> {
+  const user = await authUser(req, env);
+  if (!user) return json(env, { error: "unauthorized" }, 401);
+  const day = utcDay(Date.now());
+  const db = env.DB;
+  const [p, d, friends, username] = await Promise.all([
+    db.prepare("SELECT total_revs, total_points, ref_points FROM players WHERE id = ?")
+      .bind(user.id)
+      .first<{ total_revs: number; total_points: number; ref_points: number }>(),
+    db.prepare("SELECT revs, points FROM daily WHERE day = ? AND player_id = ?")
+      .bind(day, user.id)
+      .first<{ revs: number; points: number }>(),
+    db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN total_revs > 0 THEN 1 ELSE 0 END) AS active FROM players WHERE ref_by = ?")
+      .bind(user.id)
+      .first<{ n: number; active: number | null }>(),
+    botUsername(env),
+  ]);
+  const todayPoints = d?.points ?? 0;
+  return json(env, {
+    day,
+    today: { revs: d?.revs ?? 0, points: todayPoints, rank: todayPoints > 0 ? await rankFor(env, "today", day, todayPoints) : null },
+    total: { revs: p?.total_revs ?? 0, points: p?.total_points ?? 0 },
+    invites: { friends: friends?.n ?? 0, active: friends?.active ?? 0, bonusPoints: p?.ref_points ?? 0, pct: REF_BONUS_PCT },
+    inviteLink: inviteLink(env, username, user.id),
+  });
+}
 
 async function handleState(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const now = Date.now();
@@ -213,17 +322,23 @@ async function handleSpin(req: Request, env: Env): Promise<Response> {
   const day = utcDay(now);
   const db = env.DB;
 
-  const prev = await db
-    .prepare("SELECT last_batch_at, last_seq FROM players WHERE id = ?")
+  let prev = await db
+    .prepare("SELECT last_batch_at, last_seq, ref_by FROM players WHERE id = ?")
     .bind(user.id)
-    .first<{ last_batch_at: number; last_seq: number }>();
+    .first<{ last_batch_at: number; last_seq: number; ref_by: number | null }>();
   if (!prev) {
+    // First time we see this player: an invite link opened as a Mini App carries startapp=r<id>.
+    await attachReferral(env, user, parseRef(user.startParam), now);
     await db
       .prepare(
         "INSERT OR IGNORE INTO players (id, username, first_name, created_at) VALUES (?, ?, ?, ?)",
       )
       .bind(user.id, user.username ?? null, user.first_name ?? null, now)
       .run();
+    prev = await db
+      .prepare("SELECT last_batch_at, last_seq, ref_by FROM players WHERE id = ?")
+      .bind(user.id)
+      .first<{ last_batch_at: number; last_seq: number; ref_by: number | null }>();
   }
   const lastSeq = prev?.last_seq ?? 0;
   const lastBatchAt = prev?.last_batch_at ?? 0;
@@ -247,7 +362,7 @@ async function handleSpin(req: Request, env: Env): Promise<Response> {
   if (!upd.meta.changes) return json(env, { error: "replay", lastSeq }, 409);
 
   if (revs > 0) {
-    await db.batch([
+    const writes = [
       db
         .prepare(
           "INSERT INTO daily (day, player_id, revs, points) VALUES (?, ?, ?, ?) " +
@@ -261,7 +376,23 @@ async function handleSpin(req: Request, env: Env): Promise<Response> {
             "human_points = human_points + excluded.human_points, updated_at = excluded.updated_at",
         )
         .bind(day, revs, points, now),
-    ]);
+    ];
+    // Inviter's cut: REF_BONUS_PCT% of what this friend just earned.
+    const bonus = prev?.ref_by ? refBonus(points) : 0;
+    if (prev?.ref_by && bonus > 0) {
+      writes.push(
+        db
+          .prepare("UPDATE players SET total_points = total_points + ?, ref_points = ref_points + ? WHERE id = ?")
+          .bind(bonus, bonus, prev.ref_by),
+        db
+          .prepare(
+            "INSERT INTO daily (day, player_id, revs, points) VALUES (?, ?, 0, ?) " +
+              "ON CONFLICT(day, player_id) DO UPDATE SET points = points + excluded.points",
+          )
+          .bind(day, prev.ref_by, bonus),
+      );
+    }
+    await db.batch(writes);
   }
 
   const [me, g] = await Promise.all([
@@ -314,15 +445,7 @@ async function handleLeaderboard(req: Request, env: Env): Promise<Response> {
             .bind(day, user.id)
             .first<{ points: number; revs: number }>();
     if (mine && mine.points > 0) {
-      const ahead =
-        scope === "all"
-          ? await env.DB.prepare("SELECT COUNT(*) AS n FROM players WHERE total_points > ?")
-              .bind(mine.points)
-              .first<{ n: number }>()
-          : await env.DB.prepare("SELECT COUNT(*) AS n FROM daily WHERE day = ? AND points > ?")
-              .bind(day, mine.points)
-              .first<{ n: number }>();
-      me = { rank: (ahead?.n ?? 0) + 1, points: mine.points, revs: mine.revs };
+      me = { rank: await rankFor(env, scope, day, mine.points), points: mine.points, revs: mine.revs };
     }
   }
 
@@ -342,71 +465,109 @@ async function handleLeaderboard(req: Request, env: Env): Promise<Response> {
 
 // ---------------------------------------------------------------- Telegram bot
 
+async function topText(env: Env, day: string): Promise<string> {
+  const rows = await env.DB.prepare(
+    "SELECT p.id, p.username, p.first_name, d.points FROM daily d JOIN players p ON p.id = d.player_id " +
+      "WHERE d.day = ? AND d.points > 0 ORDER BY d.points DESC LIMIT 10",
+  )
+    .bind(day)
+    .all();
+  const lines = (rows.results as any[]).map(
+    (r, i) => `${i + 1}. ${esc(displayName(r))} — ${r.points.toLocaleString("en-US")}`,
+  );
+  return `🏆 <b>Today's top spinners</b> (${day} UTC)\n\n${lines.join("\n") || "Nobody yet. Be first."}`;
+}
+
+async function hamsterText(env: Env, now: number): Promise<string> {
+  const h = await hamsterNow(env, now);
+  const g = await globalToday(env, utcDay(now));
+  const line =
+    h.signal === "none"
+      ? "📡 No signal from the wheel right now."
+      : h.fault
+        ? "⚠️ Wheel counter fault."
+        : h.running
+          ? `🏃 Squeektoshi is RUNNING — ${h.rpm.toFixed(0)} rpm. Boost ×${(boostMilli(true, h.rpm) / 1000).toFixed(1)}`
+          : "😴 Squeektoshi is asleep. Night shift is on.";
+  return `${line}\n\nToday: humans ${humanWork(g.human_revs).toFixed(2)} vs hamster ${g.hamster_work} work units`;
+}
+
 async function handleWebhook(req: Request, env: Env): Promise<Response> {
   if (req.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
     return new Response("forbidden", { status: 403 });
   }
   const update = (await req.json().catch(() => null)) as any;
+  const now = Date.now();
+  const origin = new URL(req.url).origin; // Telegram calls us on our own origin
+  const url = env.WEBAPP_URL || origin;
+  const t = env.BOT_TOKEN;
+
+  // Inline buttons under bot messages ("🏆 Top", "🐹 Is he running?")
+  const cb = update?.callback_query;
+  if (cb) {
+    await tgCall(t, "answerCallbackQuery", { callback_query_id: cb.id });
+    const chatId = cb.message?.chat?.id;
+    if (chatId && cb.data === "top") await sendMessage(t, chatId, await topText(env, utcDay(now)), [[{ text: "🐹 Spin the wheel", web_app: { url } }]]);
+    if (chatId && cb.data === "hamster") await sendMessage(t, chatId, await hamsterText(env, now), [[{ text: "🐹 Spin the wheel", web_app: { url } }]]);
+    return new Response("ok");
+  }
+
   const msg = update?.message;
   const text: string = msg?.text ?? "";
   const chatId = msg?.chat?.id;
   if (!chatId || !text.startsWith("/")) return new Response("ok");
 
-  const cmd = text.split(/[\s@]/)[0].toLowerCase();
-  const now = Date.now();
+  const [cmdRaw, payload] = text.split(/\s+/, 2);
+  const cmd = cmdRaw.split("@")[0].toLowerCase();
   const isPrivate = msg.chat.type === "private";
-  // Telegram calls us on our own origin, so that's the app URL.
-  const url = env.WEBAPP_URL || new URL(req.url).origin;
-  const button = isPrivate
-    ? ({ text: "🐹 Spin the wheel", web_app: { url } } as InlineButton)
-    : spinButton(env, url);
+  const from = msg.from as { id: number; username?: string; first_name?: string } | undefined;
+  const spin: InlineButton = isPrivate ? { text: "🐹 Spin the wheel", web_app: { url } } : spinButton(env, url);
+  const username = await botUsername(env);
+  const myLink = from ? inviteLink(env, username, from.id) : null;
 
   if (cmd === "/start") {
-    await sendMessage(
-      env.BOT_TOKEN,
-      chatId,
-      "🐹 <b>Squeektoshi game</b>\n\n" +
-        "Squeektoshi mines blocks on a real wheel. Spin yours with him.\n\n" +
-        "• He's running → his live rpm boosts every spin\n" +
-        "• He's asleep → night shift: humans keep the wheel going, but 1000 human spins = 1 hamster turn\n\n" +
-        "/top — leaderboard · /hamster — is he running?\n\n" +
-        "<i>Community game on Squeekchain's public data. Not affiliated with Squeekchain.</i>",
-      [[button]],
-    );
+    let invited = false;
+    if (isPrivate && from) {
+      invited = await attachReferral(env, from, parseRef(payload), now);
+      // Make sure the player exists so their own invite link works right away.
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO players (id, username, first_name, created_at) VALUES (?, ?, ?, ?)",
+      )
+        .bind(from.id, from.username ?? null, from.first_name ?? null, now)
+        .run();
+    }
+    const caption =
+      `🐹 <b>${BOT_NAME}</b>\n\n` +
+      "Squeektoshi is a real hamster mining Squeekchain on his wheel. Spin yours with him.\n\n" +
+      "• He's running → his live rpm boosts every spin\n" +
+      "• He's asleep → night shift: 1,000 human spins = 1 hamster turn\n" +
+      `• Invite friends → you get +${REF_BONUS_PCT}% of their points\n\n` +
+      (invited ? "✅ You joined through a friend's invite.\n\n" : "") +
+      "<i>Community game on Squeekchain's public data. Not affiliated with Squeekchain.</i>";
+    const keyboard: InlineButton[][] = [[spin]];
+    if (isPrivate) {
+      const row: InlineButton[] = [];
+      if (myLink) row.push({ text: "👥 Invite friends", url: shareUrl(myLink) });
+      row.push({ text: "🏆 Top", callback_data: "top" });
+      keyboard.push(row);
+    }
+    const sent = (await sendPhoto(t, chatId, `${origin}/welcome.png`, caption, keyboard)) as { ok?: boolean } | null;
+    if (!sent?.ok) await sendMessage(t, chatId, caption, keyboard); // e.g. image not deployed yet
   } else if (cmd === "/hamster") {
-    const h = await hamsterNow(env, now);
-    const g = await globalToday(env, utcDay(now));
-    const line =
-      h.signal === "none"
-        ? "📡 No signal from the wheel right now."
-        : h.fault
-          ? "⚠️ Wheel counter fault."
-          : h.running
-            ? `🏃 Squeektoshi is RUNNING — ${h.rpm.toFixed(0)} rpm. Boost ×${(boostMilli(true, h.rpm) / 1000).toFixed(1)}`
-            : "😴 Squeektoshi is asleep. Night shift is on.";
-    await sendMessage(
-      env.BOT_TOKEN,
-      chatId,
-      `${line}\n\nToday: humans ${humanWork(g.human_revs).toFixed(2)} vs hamster ${g.hamster_work} work units`,
-      [[button]],
-    );
+    await sendMessage(t, chatId, await hamsterText(env, now), [[spin]]);
   } else if (cmd === "/top") {
-    const day = utcDay(now);
-    const rows = await env.DB.prepare(
-      "SELECT p.id, p.username, p.first_name, d.points FROM daily d JOIN players p ON p.id = d.player_id " +
-        "WHERE d.day = ? AND d.points > 0 ORDER BY d.points DESC LIMIT 10",
-    )
-      .bind(day)
-      .all();
-    const lines = (rows.results as any[]).map(
-      (r, i) => `${i + 1}. ${esc(displayName(r))} — ${r.points.toLocaleString("en-US")}`,
-    );
-    await sendMessage(
-      env.BOT_TOKEN,
-      chatId,
-      `🏆 <b>Today's top spinners</b> (${day} UTC)\n\n${lines.join("\n") || "Nobody yet. Be first."}`,
-      [[button]],
-    );
+    await sendMessage(t, chatId, await topText(env, utcDay(now)), [[spin]]);
+  } else if (cmd === "/invite" && isPrivate && from) {
+    if (!myLink) {
+      await sendMessage(t, chatId, "Invite links will be ready in a minute. Try /invite again shortly.");
+    } else {
+      await sendMessage(
+        t,
+        chatId,
+        `👥 <b>Your invite link</b>\n\n${esc(myLink)}\n\nFriends who join through it give you +${REF_BONUS_PCT}% of every point they spin.`,
+        [[{ text: "Share", url: shareUrl(myLink) }], [spin]],
+      );
+    }
   }
   return new Response("ok");
 }
@@ -511,8 +672,12 @@ export default {
     const { pathname } = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
     try {
+      if (pathname.startsWith("/api/") || pathname.startsWith("/tg/") || pathname.startsWith("/dev/")) {
+        await ensureSchema(env.DB);
+      }
       if (pathname === "/api/state" && req.method === "GET") return await handleState(req, env, ctx);
       if (pathname === "/api/spin" && req.method === "POST") return await handleSpin(req, env);
+      if (pathname === "/api/me" && req.method === "GET") return await handleMe(req, env);
       if (pathname === "/api/leaderboard" && req.method === "GET") return await handleLeaderboard(req, env);
       if (pathname === "/tg/webhook" && req.method === "POST") return await handleWebhook(req, env);
       // Local testing only (DEV_ALLOW_UNSIGNED=1): run the recap job on demand.
@@ -530,6 +695,7 @@ export default {
   },
 
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    await ensureSchema(env.DB);
     ctx.waitUntil(everyMinute(env));
     // Yesterday's recap: tried every minute 06:00–06:30 UTC until Telegram accepts it.
     const d = new Date();

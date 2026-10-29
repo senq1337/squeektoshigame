@@ -4,6 +4,7 @@ export interface TgUser {
   id: number;
   username?: string;
   first_name?: string;
+  startParam?: string; // from t.me/<bot>/<app>?startapp=... (referral payload)
 }
 
 const enc = new TextEncoder();
@@ -63,7 +64,12 @@ export async function verifyInitData(
   try {
     const user = JSON.parse(params.get("user") ?? "null");
     if (!user || typeof user.id !== "number") return null;
-    return { id: user.id, username: user.username, first_name: user.first_name };
+    return {
+      id: user.id,
+      username: user.username,
+      first_name: user.first_name,
+      ...(params.get("start_param") ? { startParam: params.get("start_param")! } : {}),
+    };
   } catch {
     return null;
   }
@@ -89,7 +95,8 @@ export async function signInitData(
 
 export type InlineButton =
   | { text: string; web_app: { url: string } }
-  | { text: string; url: string };
+  | { text: string; url: string }
+  | { text: string; callback_data: string };
 
 /**
  * Never throws: a failed send is logged, not raised. Otherwise one Telegram hiccup would make
@@ -122,6 +129,22 @@ export function sendMessage(
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
+    ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+  });
+}
+
+export function sendPhoto(
+  token: string,
+  chatId: string | number,
+  photoUrl: string,
+  caption: string,
+  buttons?: InlineButton[][],
+) {
+  return tgCall(token, "sendPhoto", {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption,
+    parse_mode: "HTML",
     ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
   });
 }

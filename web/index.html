@@ -121,6 +121,7 @@
   button { font: inherit; }
   .btn { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; padding: 11px 10px; border-radius: 4px; border: 1px solid var(--line2); background: var(--raised); color: var(--white); cursor: pointer; }
   .btn.primary { background: var(--white); color: var(--bg); border-color: var(--white); }
+  .btn:disabled { opacity: .45; cursor: default; }
   .btn:focus-visible, .seg button:focus-visible { outline: 2px solid var(--active); outline-offset: 2px; }
 
   /* Leaderboard */
@@ -174,6 +175,19 @@
     <div class="share">
       <button class="btn primary" id="shareTg" type="button">Share in Telegram</button>
       <button class="btn" id="shareX" type="button">Post on X</button>
+    </div>
+  </section>
+
+  <section class="panel" aria-label="Friends">
+    <p class="label">Friends</p>
+    <div class="stats" style="margin-top:8px">
+      <div class="stat"><div class="num" id="frCount">0</div><p class="label">Invited</p></div>
+      <div class="stat"><div class="num" id="frActive">0</div><p class="label">Spinning</p></div>
+      <div class="stat"><div class="num gold" id="frBonus">0</div><p class="label">Bonus pts</p></div>
+    </div>
+    <p class="note" id="frNote">You get +10% of every point your friends spin.</p>
+    <div class="share" style="grid-template-columns:1fr">
+      <button class="btn primary" id="inviteBtn" type="button" disabled>Invite friends</button>
     </div>
   </section>
 
@@ -239,6 +253,7 @@
       return { status: r.status, body: await r.json().catch(() => ({})) };
     },
     async board(scope) { const p = "/api/leaderboard?scope=" + scope; const r = await fetch(API + p + qs(p), { headers: hdrs(false) }); if (!r.ok) throw r; return r.json(); },
+    async me() { const r = await fetch(API + "/api/me" + qs("/api/me"), { headers: hdrs(false) }); if (!r.ok) throw r; return r.json(); },
   };
 
   // Demo: Squeektoshi alternates 25 s running / 25 s asleep; fake crowd; your spins count locally.
@@ -271,6 +286,10 @@
       const rank = all.findIndex((x) => x.me) + 1;
       return { scope, top: all.slice(0, 8).map((x, i) => Object.assign({ rank: i + 1, me: !!x.me }, x)),
         me: demoDb.mine.pts > 0 ? { rank, points: demoDb.mine.pts, revs: demoDb.mine.revs } : null };
+    },
+    async me() {
+      return { today: { revs: demoDb.mine.revs, points: demoDb.mine.pts, rank: null }, total: { revs: demoDb.mine.revs, points: demoDb.mine.pts },
+        invites: { friends: 3, active: 2, bonusPoints: 148, pct: 10 }, inviteLink: "https://t.me/squeektoshigame?start=r1" };
     },
   };
   const api = DEMO ? demo : real;
@@ -329,6 +348,26 @@
   }
 
   async function loadState() { try { render(await api.state()); } catch (_) {} }
+
+  // ================================================================ me + friends
+  let inviteUrl = null;
+  async function loadMe() {
+    if (!authed) return;
+    try {
+      const m = await api.me();
+      const srvRevs = m.today.revs + pending;
+      if (srvRevs > myRevs) { myRevs = srvRevs; myPts = m.today.points + Math.floor(pending * boost); }
+      if (m.today.rank) myRank = m.today.rank;
+      renderMine();
+      $("frCount").textContent = fmt(m.invites.friends);
+      $("frActive").textContent = fmt(m.invites.active);
+      $("frBonus").textContent = fmt(m.invites.bonusPoints);
+      $("frNote").textContent = `You get +${m.invites.pct}% of every point your friends spin.`;
+      inviteUrl = m.inviteLink;
+      $("inviteBtn").disabled = !inviteUrl;
+      $("inviteBtn").textContent = inviteUrl ? "Invite friends" : "Invite link is being set up";
+    } catch (_) {}
+  }
 
   // ================================================================ leaderboard
   let scope = "today";
@@ -410,10 +449,17 @@
     if (tg && tg.openLink) { try { tg.openLink(url); return; } catch (_) {} }
     window.open(url, "_blank", "noopener");
   };
+  // Shares carry your personal invite link when there is one, so every share can bring you friends.
+  const myLink = () => inviteUrl || APP_LINK;
   $("shareTg").addEventListener("click", () =>
-    open("https://t.me/share/url?url=" + encodeURIComponent(APP_LINK) + "&text=" + encodeURIComponent(shareText()), true));
+    open("https://t.me/share/url?url=" + encodeURIComponent(myLink()) + "&text=" + encodeURIComponent(shareText()), true));
   $("shareX").addEventListener("click", () =>
-    open("https://x.com/intent/post?text=" + encodeURIComponent(shareText().replace("on @squeekchain", "") + " on @squeekchain\n" + APP_LINK), false));
+    open("https://x.com/intent/post?text=" + encodeURIComponent(shareText().replace("on @squeekchain", "") + " on @squeekchain\n" + myLink()), false));
+  $("inviteBtn").addEventListener("click", () => {
+    if (!inviteUrl) return;
+    open("https://t.me/share/url?url=" + encodeURIComponent(inviteUrl) + "&text=" +
+      encodeURIComponent("Spin the wheel with Squeektoshi, the hamster mining Squeekchain 🐹 When he runs, his rpm boosts your spins."), true);
+  });
 
   // ================================================================ the wheel (dot-matrix, canvas)
   const canvas = $("wheel"), ctx = canvas.getContext("2d");
@@ -579,9 +625,10 @@
   if (!authed) toast("Open this from the Telegram bot to save your spins.");
   if (!store.get("sw_coached")) $("coach").hidden = false;
   resize(); requestAnimationFrame(frame);
-  loadState(); loadBoard();
+  loadState(); loadMe(); loadBoard();
   setInterval(loadState, DEMO ? 3000 : 10000);
   setInterval(loadBoard, DEMO ? 8000 : 60000);
+  setInterval(loadMe, 60000);
 })();
 </script>
 </body>

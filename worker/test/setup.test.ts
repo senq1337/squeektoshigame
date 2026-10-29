@@ -34,8 +34,9 @@ describe("ensureBotSetup", () => {
   it("points webhook + menu button at this origin, once", async () => {
     const calls: { method: string; body: any }[] = [];
     vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
-      calls.push({ method: url.split("/").pop()!, body: JSON.parse(init.body as string) });
-      return new Response(JSON.stringify({ ok: true }));
+      const method = url.split("/").pop()!;
+      calls.push({ method, body: JSON.parse(init.body as string) });
+      return new Response(JSON.stringify({ ok: true, result: method === "getMe" ? { username: "squeektoshigame" } : true }));
     });
     const db = fakeDb();
     await ensureBotSetup(env(db), "https://squeektoshi.me.workers.dev");
@@ -45,7 +46,9 @@ describe("ensureBotSetup", () => {
     const menu = calls.find((c) => c.method === "setChatMenuButton")!;
     expect(menu.body.menu_button.web_app.url).toBe("https://squeektoshi.me.workers.dev");
     expect(calls.map((c) => c.method)).toContain("setMyDescription");
-    expect(JSON.parse(db.kv.get("bot_setup")!)).toMatchObject({ origin: "https://squeektoshi.me.workers.dev" });
+    expect(calls.find((c) => c.method === "setMyName")!.body.name).toBe("Squeektoshi Game");
+    expect(hook.body.allowed_updates).toContain("callback_query");
+    expect(JSON.parse(db.kv.get("bot_setup")!)).toMatchObject({ origin: "https://squeektoshi.me.workers.dev", username: "squeektoshigame" });
 
     // Second call: already set up for this origin -> no Telegram calls.
     _resetSetupThrottle();
