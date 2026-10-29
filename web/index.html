@@ -270,7 +270,7 @@
       const all = others.concat([{ name: "You", points: demoDb.mine.pts, me: true }]).sort((a, b) => b.points - a.points);
       const rank = all.findIndex((x) => x.me) + 1;
       return { scope, top: all.slice(0, 8).map((x, i) => Object.assign({ rank: i + 1, me: !!x.me }, x)),
-        me: demoDb.mine.pts > 0 ? { rank, points: demoDb.mine.pts } : null };
+        me: demoDb.mine.pts > 0 ? { rank, points: demoDb.mine.pts, revs: demoDb.mine.revs } : null };
     },
   };
   const api = DEMO ? demo : real;
@@ -335,7 +335,13 @@
   async function loadBoard() {
     try {
       const data = await api.board(scope);
-      if (scope === "today") { myRank = data.me ? data.me.rank : myRank; renderMine(); }
+      if (scope === "today" && data.me) {
+        myRank = data.me.rank;
+        // On (re)open, restore today's numbers from the server; never move the counters backwards.
+        const srvRevs = (data.me.revs || 0) + pending;
+        if (srvRevs > myRevs) { myRevs = srvRevs; myPts = data.me.points + Math.floor(pending * boost); }
+        renderMine();
+      }
       const ol = $("board"); ol.innerHTML = "";
       if (!data.top.length) {
         const li = document.createElement("li"); li.className = "empty";
