@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Squeek Wheel</title>
+<!-- Worker URL. Replace after `wrangler deploy` prints it. -->
+<meta name="api" content="https://squeek-wheel.REPLACE.workers.dev">
+<!-- Mini App link used in share messages (from BotFather /newapp). -->
+<meta name="app-link" content="https://t.me/REPLACE_bot/wheel">
+<!-- "1" = offline demo with simulated data (used for the preview build). -->
+<meta name="demo" content="0">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@300;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* Follows Squeekchain's own day/night themes:
+     night (dark)  = Squeektoshi asleep or no signal
+     day   (light) = Squeektoshi running */
+  :root {
+    --bg: #0b0b0d;
+    --raised: #0f0f12;
+    --line: #1c1c24;
+    --line2: #26262f;
+    --dim: #3a3a46;
+    --gray: #6e6e7a;
+    --gray-lit: #82828f;
+    --white: #f2f2f4;
+    --blue: #5b7cfa;
+    --green: #35d07f;
+    --orange: #e8b04a;
+    --gold: #f2c230;
+    --pink: #f06bae;
+    --active: #7fd4ff;
+    --on-active: #0b0b0d;
+    --rim: #e8b04a;       /* wheel rungs */
+    --spoke: #3a3a46;
+    --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  body[data-theme="light"] {
+    --bg: #f5f5f7;
+    --raised: #ededf0;
+    --line: #e0e0e6;
+    --line2: #d2d2da;
+    --dim: #b6b6c2;
+    --gray: #6e6e7a;
+    --gray-lit: #5c5c68;
+    --white: #17171b;
+    --blue: #4460cf;
+    --green: #1b7849;
+    --orange: #886423;
+    --gold: #84660f;
+    --active: #003a5c;
+    --on-active: #f7f7f9;
+    --rim: #b8883a;
+    --spoke: #c9cad2;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background-color: var(--bg);
+    background-image: radial-gradient(circle, var(--line2) 1px, transparent 1.3px);
+    background-size: 14px 14px;
+    color: var(--white);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    transition: background-color .7s ease, color .7s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  main { max-width: 460px; margin: 0 auto; padding: 14px 12px calc(24px + env(safe-area-inset-bottom)); }
+
+  .panel { background: var(--raised); border: 1px solid var(--line); border-radius: 6px; padding: 14px; margin-top: 10px; }
+  .label { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--gray-lit); margin: 0; font-weight: 400; }
+
+  /* Top bar: app name + live status chip */
+  .top { display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--line2); border-radius: 4px; padding: 4px 8px; color: var(--gray-lit); }
+  .chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+  .chip[data-s="live"] { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+  .chip[data-s="live"] i { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 25%, transparent); }
+  .chip[data-s="warn"] { color: var(--orange); }
+  .chip[data-s="warn"] i { background: var(--orange); }
+
+  /* Hero: status + the wheel */
+  .hero { padding: 16px 14px 6px; }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(38px, 11vw, 50px); line-height: .95; letter-spacing: .005em; text-transform: uppercase; margin: 0; }
+  .sub { margin: 10px 0 0; color: var(--gray-lit); max-width: 40ch; }
+  .sub b { color: var(--white); font-weight: 500; }
+  .wheel-wrap { position: relative; width: min(100%, 380px); aspect-ratio: 1; margin: 6px auto 0; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; outline: none; border-radius: 8px; }
+  canvas:active { cursor: grabbing; }
+  canvas:focus-visible { box-shadow: 0 0 0 2px var(--active); }
+  .coach {
+    position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none;
+    transition: opacity .4s ease;
+  }
+  .coach[hidden] { display: none; }
+  .coach span { background: var(--active); color: var(--on-active); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; padding: 6px 10px; border-radius: 4px; transform: translateY(-38%); }
+
+  /* Stats */
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat .num { font-family: var(--display); font-weight: 300; font-size: 34px; line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .stat .num.gold { color: var(--gold); }
+
+  /* Humans vs hamster: dot bars */
+  .vs-row { display: grid; grid-template-columns: 72px 1fr auto; align-items: center; gap: 10px; margin-top: 10px; }
+  .dots { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; }
+  .dots b { aspect-ratio: 1; border-radius: 50%; background: var(--line2); }
+  .dots b.on { background: var(--rim); }
+  .vs-row.humans .dots b.on { background: var(--blue); }
+  .vs-row .val { font-family: var(--display); font-size: 22px; font-weight: 300; min-width: 4.5ch; text-align: right; font-variant-numeric: tabular-nums; }
+  .note { margin: 10px 0 0; color: var(--gray-lit); font-size: 12px; }
+
+  /* Share */
+  .share { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  button { font: inherit; }
+  .btn { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; padding: 11px 10px; border-radius: 4px; border: 1px solid var(--line2); background: var(--raised); color: var(--white); cursor: pointer; }
+  .btn.primary { background: var(--white); color: var(--bg); border-color: var(--white); }
+  .btn:focus-visible, .seg button:focus-visible { outline: 2px solid var(--active); outline-offset: 2px; }
+
+  /* Leaderboard */
+  .board-head { display: flex; align-items: center; justify-content: space-between; }
+  .seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 4px; overflow: hidden; }
+  .seg button { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; background: none; border: 0; color: var(--gray-lit); padding: 5px 10px; cursor: pointer; }
+  .seg button[aria-selected="true"] { background: var(--active); color: var(--on-active); }
+  ol { list-style: none; margin: 10px 0 0; padding: 0; }
+  li { display: grid; grid-template-columns: 2.6em 1fr auto; gap: 8px; padding: 7px 4px; border-top: 1px solid var(--line); font-size: 13px; }
+  li:first-child { border-top: 0; }
+  li .r { color: var(--gray); font-variant-numeric: tabular-nums; }
+  li .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .p { font-variant-numeric: tabular-nums; color: var(--gold); }
+  li.me { background: color-mix(in srgb, var(--active) 14%, transparent); border-radius: 4px; }
+  li.gap { color: var(--gray); justify-content: center; grid-template-columns: 1fr; text-align: center; padding: 2px; border: 0; }
+  .empty { color: var(--gray-lit); padding: 8px 4px; }
+
+  footer { text-align: center; color: var(--gray); font-size: 11px; margin-top: 16px; }
+
+  .toast { position: fixed; left: 50%; bottom: calc(16px + env(safe-area-inset-bottom)); transform: translate(-50%, 16px); opacity: 0;
+    background: var(--white); color: var(--bg); padding: 9px 14px; border-radius: 4px; font-size: 12px; max-width: calc(100% - 24px);
+    transition: opacity .2s, transform .2s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  @media (prefers-reduced-motion: reduce) { body, .toast, .coach { transition: none; } }
+</style>
+</head>
+<body data-theme="dark">
+<main>
+  <div class="top">
+    <p class="label">Squeek wheel</p>
+    <span class="chip" id="chip" data-s="off"><i></i><span id="chipText">Connecting</span></span>
+  </div>
+
+  <section class="panel hero" aria-live="polite">
+    <h1 id="headline">Checking on Squeektoshi</h1>
+    <p class="sub" id="subline">Reading the wheel.</p>
+    <div class="wheel-wrap">
+      <canvas id="wheel" tabindex="0" role="button" aria-label="Your wheel. Drag around it to spin, or press Space."></canvas>
+      <div class="coach" id="coach" hidden><span>Drag around the wheel to spin</span></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-label="Your day">
+    <p class="label">Your shift today</p>
+    <div class="stats" style="margin-top:8px">
+      <div class="stat"><div class="num" id="myRevs">0</div><p class="label">Spins</p></div>
+      <div class="stat"><div class="num gold" id="myPts">0</div><p class="label">Points</p></div>
+      <div class="stat"><div class="num" id="myRank">–</div><p class="label">Rank</p></div>
+    </div>
+    <div class="share">
+      <button class="btn primary" id="shareTg" type="button">Share in Telegram</button>
+      <button class="btn" id="shareX" type="button">Post on X</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <p class="label">Humans vs hamster today</p>
+    <div class="vs-row"><p class="label">Hamster</p><div class="dots" id="dotsHam"></div><span class="val" id="valHam">0</span></div>
+    <div class="vs-row humans"><p class="label">Humans</p><div class="dots" id="dotsHum"></div><span class="val" id="valHum">0</span></div>
+    <p class="note" id="vsNote">Counted in hamster turns. 1,000 human spins make one.</p>
+  </section>
+
+  <section class="panel">
+    <div class="board-head">
+      <p class="label">Top spinners</p>
+      <div class="seg" role="tablist">
+        <button role="tab" aria-selected="true" data-scope="today">Today</button>
+        <button role="tab" aria-selected="false" data-scope="all">All time</button>
+      </div>
+    </div>
+    <ol id="board"></ol>
+  </section>
+
+  <footer>Community-built on Squeekchain's public data. Not an official Squeekchain app.</footer>
+</main>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+(() => {
+  // ================================================================ setup
+  const meta = (n) => (document.querySelector(`meta[name="${n}"]`) || {}).content || "";
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const initData = (tg && tg.initData) || "";
+  const params = new URLSearchParams(location.search);
+  const DEMO = meta("demo") === "1" || params.get("demo") === "1";
+  // Outside Telegram, ?dev=1&user=5[&api=http://127.0.0.1:8787] talks to a worker with
+  // DEV_ALLOW_UNSIGNED=1 (local testing only; production workers reject unsigned requests).
+  const devUser = !initData && params.get("dev") === "1" ? params.get("user") || "1" : null;
+  const API = ((devUser && params.get("api")) || meta("api")).replace(/\/$/, "");
+  const APP_LINK = meta("app-link");
+  const authed = DEMO || !!initData || !!devUser;
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (tg) { try { tg.ready(); tg.expand(); } catch (_) {} }
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n, d = 0) => Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (_) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+  };
+  let toastTimer;
+  function toast(msg) {
+    const t = $("toast"); t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+  }
+
+  // ================================================================ API (real or demo)
+  const qs = (p) => devUser ? (p.includes("?") ? "&" : "?") + "dev_user=" + encodeURIComponent(devUser) : "";
+  const hdrs = (json) => Object.assign(json ? { "content-type": "application/json" } : {}, initData ? { "x-init-data": initData } : {});
+
+  const real = {
+    async state() { const r = await fetch(API + "/api/state" + qs("/api/state")); if (!r.ok) throw r; return r.json(); },
+    async spin(revs, seq) {
+      const r = await fetch(API + "/api/spin" + qs("/api/spin"), { method: "POST", headers: hdrs(true), body: JSON.stringify({ revs, seq }) });
+      return { status: r.status, body: await r.json().catch(() => ({})) };
+    },
+    async board(scope) { const p = "/api/leaderboard?scope=" + scope; const r = await fetch(API + p + qs(p), { headers: hdrs(false) }); if (!r.ok) throw r; return r.json(); },
+  };
+
+  // Demo: Squeektoshi alternates 25 s running / 25 s asleep; fake crowd; your spins count locally.
+  const demoDb = { t0: Date.now(), humanRevs: 48210, ham0: 318, mine: { revs: 0, pts: 0 } };
+  function demoHam() {
+    const t = (Date.now() - demoDb.t0) / 1000;
+    const running = Math.floor(t / 25) % 2 === 0;
+    const rpm = running ? 34 + 10 * Math.sin(t / 3) : 0;
+    return { signal: "live", running, fault: false, rpm: Math.round(rpm * 10) / 10, blockHeight: 2994 };
+  }
+  const demoBoost = (h) => h.running ? Math.min(1 + h.rpm / 20, 7) : 1;
+  function demoPayload() {
+    const h = demoHam();
+    const ham = demoDb.ham0 + Math.floor((Date.now() - demoDb.t0) / 4000);
+    return { day: new Date().toISOString().slice(0, 10), hamster: h, boost: Math.round(demoBoost(h) * 10) / 10,
+      today: { humanRevs: demoDb.humanRevs, humanWork: demoDb.humanRevs / 1000, hamsterWork: ham } };
+  }
+  const demoNames = ["@wheelgoblin", "@nightshift_nate", "@sqk_maxi", "@0xhamstr", "@rungrunner", "@degen_dima", "@sawdust", "@spinlord"];
+  const demo = {
+    async state() { return demoPayload(); },
+    async spin(revs) {
+      const b = demoBoost(demoHam());
+      demoDb.mine.revs += revs; demoDb.mine.pts += Math.floor(revs * b); demoDb.humanRevs += revs;
+      return { status: 200, body: Object.assign(demoPayload(), { accepted: revs, me: { today_revs: demoDb.mine.revs, today_points: demoDb.mine.pts } }) };
+    },
+    async board(scope) {
+      const k = scope === "all" ? 9 : 1;
+      const others = demoNames.map((n, i) => ({ name: n, points: Math.round((5200 - i * 560) * k) }));
+      const all = others.concat([{ name: "You", points: demoDb.mine.pts, me: true }]).sort((a, b) => b.points - a.points);
+      const rank = all.findIndex((x) => x.me) + 1;
+      return { scope, top: all.slice(0, 8).map((x, i) => Object.assign({ rank: i + 1, me: !!x.me }, x)),
+        me: demoDb.mine.pts > 0 ? { rank, points: demoDb.mine.pts } : null };
+    },
+  };
+  const api = DEMO ? demo : real;
+
+  // ================================================================ state → screen
+  let S = null;            // last /api/state payload
+  let boost = 1;
+  let myPts = 0, myRevs = 0, myRank = null;
+
+  function render(s) {
+    S = s; boost = s.boost || 1;
+    const h = s.hamster;
+    let theme = "dark", chip = "off", chipText, title, sub;
+    if (h.signal === "none") {
+      chip = "warn"; chipText = "No signal"; title = "No signal from the wheel";
+      sub = "Your spins still count, at ×1.";
+    } else if (h.fault) {
+      chip = "warn"; chipText = "Counter fault"; title = "The wheel counter is acting up";
+      sub = "Spins count at ×1 until it's fixed.";
+    } else if (h.running) {
+      theme = "light"; chip = "live"; chipText = `Live · ${fmt(h.rpm)} rpm`;
+      title = "Squeektoshi is running";
+      sub = `Spin with him. Every spin counts <b>×${fmt(boost, 1)}</b> while he runs.`;
+    } else {
+      chipText = h.signal === "stale" ? "Quiet" : "Asleep";
+      title = "Squeektoshi is asleep";
+      sub = "Night shift. Keep the wheel turning: <b>1,000 of your spins</b> equal one of his.";
+    }
+    document.body.dataset.theme = theme;
+    $("chip").dataset.s = chip; $("chipText").textContent = chipText;
+    $("headline").textContent = title;
+    $("subline").innerHTML = sub; // our own strings + numbers only
+    if (tg) { const bg = getComputedStyle(document.body).getPropertyValue("--bg").trim(); try { tg.setHeaderColor(bg); tg.setBackgroundColor(bg); } catch (_) {} }
+
+    const ham = s.today.hamsterWork || 0, hum = s.today.humanWork || 0;
+    const max = Math.max(ham, hum, 1e-9);
+    dotBar("dotsHam", ham / max); dotBar("dotsHum", hum / max, hum > 0);
+    $("valHam").textContent = fmt(ham);
+    $("valHum").textContent = hum < 10 ? fmt(hum, 2) : fmt(hum);
+    const gap = Math.ceil(ham * 1000 - (s.today.humanRevs || 0));
+    $("vsNote").textContent = ham === 0 && hum === 0 ? "Nothing on the wheel yet today. 1,000 human spins make one hamster turn."
+      : gap > 0 ? `Humans need ${fmt(gap)} more spins to catch him today.` : "Humans are ahead of the hamster today.";
+  }
+
+  function dotBar(id, frac, atLeastOne) {
+    const el = $(id), n = 24;
+    if (el.children.length !== n) { el.innerHTML = ""; for (let i = 0; i < n; i++) el.append(document.createElement("b")); }
+    let on = Math.round(frac * n); if (atLeastOne && on === 0) on = 1;
+    [...el.children].forEach((d, i) => d.classList.toggle("on", i < on));
+  }
+
+  function renderMine() {
+    $("myRevs").textContent = fmt(myRevs);
+    $("myPts").textContent = fmt(myPts);
+    $("myRank").textContent = myRank ? "#" + fmt(myRank) : "–";
+  }
+
+  async function loadState() { try { render(await api.state()); } catch (_) {} }
+
+  // ================================================================ leaderboard
+  let scope = "today";
+  async function loadBoard() {
+    try {
+      const data = await api.board(scope);
+      if (scope === "today") { myRank = data.me ? data.me.rank : myRank; renderMine(); }
+      const ol = $("board"); ol.innerHTML = "";
+      if (!data.top.length) {
+        const li = document.createElement("li"); li.className = "empty";
+        li.textContent = scope === "today" ? "No spins yet today. The top spot is open." : "No spins yet.";
+        ol.append(li); return;
+      }
+      const row = (rank, name, pts, me) => {
+        const li = document.createElement("li"); if (me) li.className = "me";
+        const r = document.createElement("span"); r.className = "r"; r.textContent = "#" + rank;
+        const n = document.createElement("span"); n.className = "n"; n.textContent = name; // user data: textContent only
+        const p = document.createElement("span"); p.className = "p"; p.textContent = fmt(pts);
+        li.append(r, n, p); return li;
+      };
+      data.top.forEach((x) => ol.append(row(x.rank, x.name, x.points, x.me)));
+      if (data.me && !data.top.some((x) => x.me)) {
+        const gap = document.createElement("li"); gap.className = "gap"; gap.textContent = "···"; ol.append(gap);
+        ol.append(row(data.me.rank, "You", data.me.points, true));
+      }
+    } catch (_) {}
+  }
+  document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => {
+    scope = b.dataset.scope;
+    document.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+    loadBoard();
+  }));
+
+  // ================================================================ sending spins
+  const uid = devUser || (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || "anon";
+  const seqKey = "sw_seq_" + uid;
+  let seq = Number(store.get(seqKey)) || 0;
+  let pending = 0, inFlight = false;
+
+  async function flush() {
+    if (inFlight || pending < 1 || !authed) return;
+    inFlight = true;
+    const revs = pending; pending = 0; seq += 1;
+    try {
+      let r = await api.spin(revs, seq);
+      if (r.status === 409) { // new device/session: jump past the server's last sequence, resend once
+        seq = (r.body.lastSeq || seq) + 1;
+        r = await api.spin(revs, seq);
+      }
+      store.set(seqKey, String(seq));
+      if (r.status === 200) {
+        const b = r.body;
+        if (b.me) { myRevs = b.me.today_revs + pending; myPts = b.me.today_points + Math.floor(pending * boost); }
+        render(b); renderMine();
+        if (b.capped) toast("That burst was faster than a wheel can turn, so only part of it counted.");
+        if (!myRank) loadBoard();
+      } else if (r.status === 401) {
+        toast("Open the wheel from the Telegram bot so your spins are saved.");
+      } else { pending += revs; }
+    } catch (_) { pending += revs; } finally { inFlight = false; }
+  }
+  setInterval(flush, 5000); // every 5 s keeps the backend inside its free tier
+  addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flush(); });
+
+  // ================================================================ share
+  function shareText() {
+    const ham = S ? S.today.hamsterWork : 0, hum = S ? S.today.humanWork : 0;
+    if (S && S.hamster.running) return `Ran ${fmt(myRevs)} spins with Squeektoshi today 🐹 every spin ×${fmt(boost, 1)} while he runs. Humans ${fmt(hum, 2)} vs hamster ${fmt(ham)} on @squeekchain`;
+    return `Put in ${fmt(myRevs)} spins on the night shift while Squeektoshi slept 🐹 Humans ${fmt(hum, 2)} vs hamster ${fmt(ham)} today. Help us catch him`;
+  }
+  const open = (url, tgLink) => {
+    if (tg && tgLink && tg.openTelegramLink) { try { tg.openTelegramLink(url); return; } catch (_) {} }
+    if (tg && tg.openLink) { try { tg.openLink(url); return; } catch (_) {} }
+    window.open(url, "_blank", "noopener");
+  };
+  $("shareTg").addEventListener("click", () =>
+    open("https://t.me/share/url?url=" + encodeURIComponent(APP_LINK) + "&text=" + encodeURIComponent(shareText()), true));
+  $("shareX").addEventListener("click", () =>
+    open("https://x.com/intent/post?text=" + encodeURIComponent(shareText().replace("on @squeekchain", "") + " on @squeekchain\n" + APP_LINK), false));
+
+  // ================================================================ the wheel (dot-matrix, canvas)
+  const canvas = $("wheel"), ctx = canvas.getContext("2d");
+  const TAU = Math.PI * 2;
+  const MAX_OMEGA = 5 * TAU;   // 5 rev/s: the server allows 6
+  const FRICTION = 0.9;        // per second
+  let theta = 0, omega = 0, travelled = 0, dragging = false, lastAngle = 0, lastT = 0, lastBuzz = 0;
+  const particles = [];
+
+  // Original dot-matrix hamster (not Squeekchain's artwork). Side view, facing right.
+  // b body, l belly, e eye, p pink (ear/nose), f feet
+  const RUN = [
+    ["..........pp....",
+     "....bbbbbbbbb...",
+     "..bbbbbbbbbbbb..",
+     ".bbbbbbbbbbbebb.",
+     "bbbbbbbbbbbbbbbp",
+     "bbbbbbbbbbbllbb.",
+     "bbbbbbbbllllll..",
+     ".bbbbblllllll...",
+     "..bbbbbbbbbb....",
+     "..f...f..f...f.."],
+    ["..........pp....",
+     "....bbbbbbbbb...",
+     "..bbbbbbbbbbbb..",
+     ".bbbbbbbbbbbebb.",
+     "bbbbbbbbbbbbbbbp",
+     "bbbbbbbbbbbllbb.",
+     "bbbbbbbbllllll..",
+     ".bbbbblllllll...",
+     "..bbbbbbbbbb....",
+     "...f...f..f.f..."],
+  ];
+  const SLEEP = [
+    "................",
+    ".....bbbbbb.....",
+    "...bbbbbbbbbbp..",
+    "..bbbbbbbbbbbbb.",
+    ".bbbbbbbbbbbeeb.",
+    ".bbbbbbbbbbbbbbp",
+    ".bbbbbbbllllbbb.",
+    "..bbbbbllllllb..",
+    "...bbbbbbbbbb...",
+  ];
+  const Z = [".zzz", "...z", "..z.", ".z..", ".zzz"];
+
+  function resize() {
+    const r = canvas.getBoundingClientRect(), dpr = Math.min(devicePixelRatio || 1, 3);
+    canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener("resize", resize);
+  const cv = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
+
+  function dot(x, y, r, c) { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
+
+  function sprite(rows, x, y, cell, alpha = 1) {
+    const col = { b: "#e8b04a", l: "#f6e6c4", e: cv("--bg"), p: "#f06bae", f: "#b8883a", z: cv("--gray-lit") };
+    ctx.globalAlpha = alpha;
+    rows.forEach((row, j) => [...row].forEach((ch, i) => {
+      if (ch !== ".") dot(x + i * cell + cell / 2, y + j * cell + cell / 2, cell * 0.42, col[ch]);
+    }));
+    ctx.globalAlpha = 1;
+  }
+
+  let frameIdx = 0, frameClock = 0;
+  function draw(dt) {
+    const w = canvas.clientWidth, h = canvas.clientHeight, cx = w / 2, cy = h * 0.46, R = Math.min(w, h) * 0.38;
+    const rim = cv("--rim"), spoke = cv("--spoke"), blue = cv("--blue"), dim = cv("--dim"), white = cv("--white");
+    ctx.clearRect(0, 0, w, h);
+
+    // Stand (behind, static): dotted legs + floor
+    for (const s of [-1, 1]) for (let t = 0; t <= 1; t += 0.06) dot(cx + s * R * 0.55 * t, cy + R * 1.18 * t, 1.7, dim);
+    for (let x = -R * 1.05; x <= R * 1.05; x += 7) dot(cx + x, cy + R * 1.2, 1.2, dim);
+
+    // Rotating wheel
+    const ringO = 72, ringI = 60;
+    for (let i = 0; i < ringO; i++) {
+      const a = theta + (i / ringO) * TAU;
+      dot(cx + Math.cos(a) * R, cy + Math.sin(a) * R, i === 0 ? 4.2 : 2.4, i === 0 ? blue : rim);
+    }
+    for (let i = 0; i < ringI; i++) {
+      const a = theta + (i / ringI) * TAU;
+      dot(cx + Math.cos(a) * R * 0.88, cy + Math.sin(a) * R * 0.88, 1.5, rim);
+    }
+    for (let k = 0; k < 6; k++) {
+      const a = theta + (k / 6) * TAU;
+      for (let t = 0.12; t < 0.86; t += 0.055) dot(cx + Math.cos(a) * R * t, cy + Math.sin(a) * R * t, 1.6, spoke);
+    }
+    dot(cx, cy, R * 0.06, white);
+
+    // The hamster: running inside at his live cadence, or asleep on the floor.
+    const running = S && S.hamster.running;
+    if (running) {
+      const rpm = Math.max(S.hamster.rpm, 10);
+      frameClock += dt;
+      const period = Math.max(0.07, Math.min(0.4, 6 / rpm)); // faster legs at higher rpm
+      if (!reduceMotion && frameClock > period) { frameClock = 0; frameIdx ^= 1; }
+      const cell = R * 0.05;
+      sprite(RUN[frameIdx], cx - 8 * cell, cy + R * 0.86 - 10 * cell - 1, cell);
+    } else if (S) {
+      const cell = R * 0.03; // asleep on the floor, right of the wheel
+      const sx = cx + R * 0.7, sy = cy + R * 1.2 - 9 * cell;
+      sprite(SLEEP, sx, sy, cell);
+      const t = reduceMotion ? 0.3 : (performance.now() / 2200) % 1;
+      sprite(Z, sx + 12 * cell, sy - 7 * cell - t * 10 * cell, cell, 1 - t * 0.9);
+    }
+
+    // "+N" floaters for each counted spin
+    const now = performance.now();
+    ctx.font = `500 ${Math.round(R * 0.11)}px "IBM Plex Mono", monospace`;
+    ctx.textAlign = "center";
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i], age = (now - p.born) / 900;
+      if (age >= 1) { particles.splice(i, 1); continue; }
+      ctx.globalAlpha = 1 - age; ctx.fillStyle = p.color;
+      ctx.fillText(p.text, cx + p.dx, cy - R * 1.02 - age * R * 0.25);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function addTravel(d) {
+    travelled += Math.abs(d);
+    while (travelled >= TAU) { travelled -= TAU; onSpin(); }
+  }
+  function onSpin() {
+    pending += 1; myRevs += 1; myPts += boost;
+    $("myRevs").textContent = fmt(myRevs); $("myPts").textContent = fmt(Math.floor(myPts));
+    if (!reduceMotion) particles.push({ text: "+" + (boost > 1 ? fmt(boost, 1) : "1"), color: boost > 1 ? cv("--green") : cv("--gold"), born: performance.now(), dx: (Math.random() - 0.5) * 60 });
+    const now = performance.now();
+    if (tg && tg.HapticFeedback && now - lastBuzz > 140) { lastBuzz = now; try { tg.HapticFeedback.impactOccurred("light"); } catch (_) {} }
+    if (!$("coach").hidden) { $("coach").hidden = true; store.set("sw_coached", "1"); }
+  }
+
+  const angleAt = (e) => { const r = canvas.getBoundingClientRect(); return Math.atan2(e.clientY - (r.top + r.height * 0.46), e.clientX - (r.left + r.width / 2)); };
+  const wrap = (a) => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+  canvas.addEventListener("pointerdown", (e) => { dragging = true; canvas.setPointerCapture(e.pointerId); lastAngle = angleAt(e); lastT = performance.now(); omega = 0; });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const now = performance.now(), a = angleAt(e), dt = Math.max((now - lastT) / 1000, 1 / 240);
+    let d = wrap(a - lastAngle); const m = MAX_OMEGA * dt; d = Math.max(-m, Math.min(m, d));
+    theta += d; addTravel(d); omega = omega * 0.6 + (d / dt) * 0.4; lastAngle = a; lastT = now;
+  });
+  const release = () => { dragging = false; };
+  canvas.addEventListener("pointerup", release); canvas.addEventListener("pointercancel", release);
+  canvas.addEventListener("keydown", (e) => {
+    if (e.key === " " || e.key === "Enter" || e.key === "ArrowRight") { e.preventDefault(); omega = Math.min(MAX_OMEGA, Math.max(0, omega) + TAU * 1.5); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); omega = Math.max(-MAX_OMEGA, Math.min(0, omega) - TAU * 1.5); }
+  });
+
+  let prev = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - prev) / 1000, 0.05); prev = now;
+    if (!dragging && omega !== 0) {
+      omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, omega));
+      const d = omega * dt; theta += d; addTravel(d);
+      omega *= Math.exp(-FRICTION * dt); if (Math.abs(omega) < 0.05) omega = 0;
+    }
+    draw(dt); requestAnimationFrame(frame);
+  }
+
+  // ================================================================ go
+  if (!authed) toast("Open this from the Telegram bot to save your spins.");
+  if (!store.get("sw_coached")) $("coach").hidden = false;
+  resize(); requestAnimationFrame(frame);
+  loadState(); loadBoard();
+  setInterval(loadState, DEMO ? 3000 : 10000);
+  setInterval(loadBoard, DEMO ? 8000 : 60000);
+})();
+</script>
+</body>
+</html>
