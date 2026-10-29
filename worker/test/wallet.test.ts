@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkAddress, csvCell, exportFlags, parseN, parseScope, toChecksum, toCsv, type ExportRow } from "../src/wallet";
+import { checkAddress, csvCell, exportCaption, exportFlags, parseN, parseScope, toChecksum, toCsv, type ExportRow } from "../src/wallet";
 
 // Test vectors from EIP-55 itself.
 const EIP55 = [
@@ -60,6 +60,15 @@ describe("export", () => {
     expect(lines[2]).toContain(`"'=HYPERLINK(""x""),""hi"""`);
     expect(csvCell("plain")).toBe("plain");
     expect(csvCell("-1")).toBe("'-1");
+  });
+
+  it("export caption is valid Telegram HTML (no bare < or >)", () => {
+    for (const scope of ["all", "week", "today"] as const) {
+      const c = exportCaption(scope, 2, 1, Date.UTC(2026, 9, 29, 18, 40));
+      const outsideTags = c.replace(/<\/?(b|i|code)>/g, "");
+      expect(outsideTags).not.toMatch(/[<>]/);
+      expect(c).toContain("&lt;24 h");
+    }
   });
 
   it("parses /export arguments", () => {

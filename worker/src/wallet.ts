@@ -122,6 +122,20 @@ export function toCsv(rows: ExportRow[], ctx: ExportCtx): string {
 }
 
 export type ExportScope = "all" | "week" | "today";
+
+/**
+ * Caption for the CSV in Telegram. Sent with parse_mode=HTML, so a bare "<" or ">" makes Telegram
+ * reject the whole message ("can't parse entities"): write them as &lt; / &gt;.
+ */
+export function exportCaption(scope: ExportScope, rows: number, withWallet: number, now: number): string {
+  const window = scope === "all" ? "all-time" : scope === "week" ? "last 7 days" : "today's";
+  return (
+    `📋 <b>Top ${rows}</b> by ${window} points, ${withWallet} with a wallet. ` +
+    `${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC\n\n` +
+    "Flags: operator · no_wallet · ref_heavy (&gt;50% of points from invites) · inviter_in_top · " +
+    "wallet_recent (&lt;24 h) · one_day"
+  );
+}
 export const parseScope = (s: string | undefined): ExportScope => (s === "week" || s === "today" ? s : "all");
 export const EXPORT_DEFAULT_N = 100;
 export const EXPORT_MAX_N = 1000;

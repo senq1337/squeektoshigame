@@ -52,7 +52,7 @@ import {
   type InlineButton,
   type TgUser,
 } from "./telegram";
-import { checkAddress, parseN, parseScope, shortAddr, toChecksum, toCsv, type ExportRow, type ExportScope } from "./wallet";
+import { checkAddress, exportCaption, parseN, parseScope, shortAddr, toChecksum, toCsv, type ExportRow, type ExportScope } from "./wallet";
 
 export interface Env {
   DB: D1Database;
@@ -409,7 +409,7 @@ async function handleWallet(req: Request, env: Env): Promise<Response> {
 const adminIds = (env: Env) =>
   new Set(
     (env.ADMIN_IDS ?? "")
-      .split(/[,\s]+/)
+      .split(/\D+/) // ids are digits; tolerates spaces, commas, quotes, a stray newline
       .map(Number)
       .filter((n) => Number.isInteger(n) && n > 0),
   );
@@ -780,18 +780,17 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
     await sendMessage(t, chatId, await walletCommand(env, from, payload, now));
   } else if (cmd === "/myid" && isPrivate && from) {
     await sendMessage(t, chatId, `Your Telegram id: <code>${from.id}</code>`);
-  } else if (cmd === "/export" && isPrivate && from && adminIds(env).has(from.id)) {
+  } else if (cmd === "/export" && isPrivate && from && !adminIds(env).has(from.id)) {
+    await sendMessage(t, chatId, `⛔ /export is for the bot admin. Your Telegram id: <code>${from.id}</code>`);
+  } else if (cmd === "/export" && isPrivate && from) {
     const scope = parseScope(payload);
     const n = parseN(args[2]);
     const rows = await exportRows(env, scope, n, now);
     const withWallet = rows.filter((r) => r.wallet).length;
     const stamp = new Date(now).toISOString().slice(0, 16).replace(/[:T]/g, "-");
-    const caption =
-      `📋 Top ${rows.length} by ${scope === "all" ? "all-time" : scope === "week" ? "last 7 days" : "today's"} points, ` +
-      `${withWallet} with a wallet. ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} UTC\n\n` +
-      "Flags: operator · no_wallet · ref_heavy (>50% of points from invites) · inviter_in_top · wallet_recent (<24 h) · one_day";
+    const caption = exportCaption(scope, rows.length, withWallet, now);
     const r = await sendDocumentText(t, chatId, toCsv(rows, { adminIds: adminIds(env), now }), `squeektoshi-top-${scope}-${stamp}.csv`, "text/csv", caption);
-    if (!r?.ok) await sendMessage(t, chatId, "Couldn't send the export. Try again in a minute.");
+    if (!r?.ok) await sendMessage(t, chatId, `Couldn't send the export: ${esc(r?.description ?? "no answer from Telegram")}`);
   }
   return new Response("ok");
 }
