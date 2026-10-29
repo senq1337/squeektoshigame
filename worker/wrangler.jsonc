@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "squeektoshi",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+
+  // The mini-app (web/index.html) is served by this same Worker, so app and API share one URL.
+  "assets": { "directory": "../web" },
+
+  // Every minute: poll the hamster, count his work for the day, wake/sleep alerts.
+  // Between 06:00 and 06:30 UTC the same run also posts yesterday's "humans vs hamster" recap.
+  "triggers": { "crons": ["* * * * *"] },
+
+  "vars": {
+    // Public Squeekchain status feed (live wheel telemetry).
+    "STATUS_URL": "https://api.squeekchain.com/v1/status",
+    // Leave empty: the app URL is this Worker's own address.
+    "WEBAPP_URL": "",
+    // Optional t.me/<bot>/<app> link (BotFather /newapp) used in share messages and channel posts.
+    "APP_LINK": "",
+    "ALLOWED_ORIGIN": "*",
+    // Telegram channel id for wake/sleep alerts and the nightly recap. Empty = off.
+    "ALERT_CHAT_ID": "",
+    // "1" only for local testing: accept requests without Telegram's signature.
+    "DEV_ALLOW_UNSIGNED": "0"
+  }
+
+  // D1 database: added here automatically by
+  //   npx wrangler d1 create squeektoshi --binding DB --update-config
+  // Secrets (never in this file): BOT_TOKEN, WEBHOOK_SECRET — set with `npx wrangler secret put`.
+}

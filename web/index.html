@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Squeek Wheel</title>
-<!-- Worker URL. Replace after `wrangler deploy` prints it. -->
-<meta name="api" content="https://squeek-wheel.REPLACE.workers.dev">
-<!-- Mini App link used in share messages (from BotFather /newapp). -->
-<meta name="app-link" content="https://t.me/REPLACE_bot/wheel">
+<title>Squeektoshi game</title>
+<!-- API base URL. Empty = same origin (the Worker serves this page). -->
+<meta name="api" content="">
+<!-- Optional t.me/<bot>/<app> link for share messages. Empty = this page's own URL. -->
+<meta name="app-link" content="https://t.me/squeektoshigame">
 <!-- "1" = offline demo with simulated data (used for the preview build). -->
 <meta name="demo" content="0">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -151,7 +151,7 @@
 <body data-theme="dark">
 <main>
   <div class="top">
-    <p class="label">Squeek wheel</p>
+    <p class="label">Squeektoshi game</p>
     <span class="chip" id="chip" data-s="off"><i></i><span id="chipText">Connecting</span></span>
   </div>
 
@@ -210,8 +210,8 @@
   // Outside Telegram, ?dev=1&user=5[&api=http://127.0.0.1:8787] talks to a worker with
   // DEV_ALLOW_UNSIGNED=1 (local testing only; production workers reject unsigned requests).
   const devUser = !initData && params.get("dev") === "1" ? params.get("user") || "1" : null;
-  const API = ((devUser && params.get("api")) || meta("api")).replace(/\/$/, "");
-  const APP_LINK = meta("app-link");
+  const API = ((devUser && params.get("api")) || meta("api")).replace(/\/$/, ""); // "" = same origin
+  const APP_LINK = meta("app-link") || location.origin;
   const authed = DEMO || !!initData || !!devUser;
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
   if (tg) { try { tg.ready(); tg.expand(); } catch (_) {} }

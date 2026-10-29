@@ -1,6 +1,10 @@
-// Squeek Wheel — Cloudflare Worker
+// Squeektoshi game — Cloudflare Worker
+// The mini-app (web/index.html) is served by this same Worker as a static asset, so the
+// app and the API share one origin: https://<name>.<subdomain>.workers.dev
 // Routes:
+//   GET  /                          the mini-app (static asset)
 //   GET  /api/state                 live hamster + today's humans-vs-hamster score
+//                                   (also sets the bot up on first call: webhook, menu button)
 //   POST /api/spin                  { revs, seq } + header X-Init-Data  -> accepted revs, my stats
 //   GET  /api/leaderboard?scope=today|all
 //   POST /tg/webhook                Telegram bot updates (/start, /top, /hamster)
@@ -19,12 +23,12 @@ import {
   type WakeMachine,
 } from "./game";
 import { getHamster, type HamsterState } from "./hamster";
-import { esc, sendMessage, verifyInitData, type InlineButton, type TgUser } from "./telegram";
+import { esc, sendMessage, tgCall, verifyInitData, type InlineButton, type TgUser } from "./telegram";
 
 export interface Env {
   DB: D1Database;
   STATUS_URL: string;
-  WEBAPP_URL: string;
+  WEBAPP_URL: string; // optional override; empty = this Worker's own origin
   ALLOWED_ORIGIN: string;
   ALERT_CHAT_ID: string;
   DEV_ALLOW_UNSIGNED: string;
@@ -80,8 +84,73 @@ async function authUser(req: Request, env: Env): Promise<TgUser | null> {
 const displayName = (r: { username: string | null; first_name: string | null; id: number }) =>
   r.username ? `@${r.username}` : r.first_name || `player ${String(r.id).slice(-4)}`;
 
-const spinButton = (env: Env, text = "🐹 Spin the wheel"): InlineButton =>
-  env.APP_LINK ? { text, url: env.APP_LINK } : { text, web_app: { url: env.WEBAPP_URL } };
+/** For channel posts: a t.me link if configured, otherwise a plain link to the app. */
+const spinButton = (env: Env, appUrl: string, text = "🐹 Spin the wheel"): InlineButton =>
+  env.APP_LINK ? { text, url: env.APP_LINK } : { text, url: appUrl };
+
+// ---------------------------------------------------------------- one-time bot setup
+
+/** Bump to re-run setup after changing commands/texts. */
+const SETUP_VERSION = 1;
+let lastSetupTry = 0;
+/** For tests. */
+export const _resetSetupThrottle = () => {
+  lastSetupTry = 0;
+};
+
+/** The app's public URL: explicit WEBAPP_URL, else the origin recorded at setup. */
+async function appUrl(env: Env): Promise<string> {
+  if (env.WEBAPP_URL) return env.WEBAPP_URL;
+  const s = await kvGet<{ origin: string }>(env.DB, "bot_setup");
+  return s?.origin ?? "";
+}
+
+/**
+ * Points the bot at this Worker the first time the app is opened from its real URL:
+ * webhook (with the secret Telegram echoes back), menu button that opens the app,
+ * command list, and a "community, not affiliated" description. Runs once per origin.
+ */
+export async function ensureBotSetup(env: Env, origin: string): Promise<void> {
+  if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !origin.startsWith("https://")) return;
+  const now = Date.now();
+  if (now - lastSetupTry < 60_000) return; // at most once a minute per isolate
+  const done = await kvGet<{ origin: string; v: number }>(env.DB, "bot_setup");
+  if (done && done.origin === origin && done.v === SETUP_VERSION) return;
+  lastSetupTry = now;
+
+  const url = env.WEBAPP_URL || origin;
+  const t = env.BOT_TOKEN;
+  const results = (await Promise.all([
+    tgCall(t, "setWebhook", {
+      url: `${origin}/tg/webhook`,
+      secret_token: env.WEBHOOK_SECRET,
+      allowed_updates: ["message"],
+      drop_pending_updates: true,
+    }),
+    tgCall(t, "setChatMenuButton", { menu_button: { type: "web_app", text: "Spin", web_app: { url } } }),
+    tgCall(t, "setMyCommands", {
+      commands: [
+        { command: "start", description: "Open the wheel" },
+        { command: "hamster", description: "Is Squeektoshi running right now?" },
+        { command: "top", description: "Today's top spinners" },
+      ],
+    }),
+    tgCall(t, "setMyShortDescription", {
+      short_description: "Spin the wheel with Squeektoshi. Community game, not affiliated with Squeekchain.",
+    }),
+    tgCall(t, "setMyDescription", {
+      description:
+        "Spin your wheel together with Squeektoshi, the hamster mining Squeekchain. " +
+        "When he runs, his live rpm boosts your spins; when he sleeps, the humans take the night shift.\n\n" +
+        "Community-built on Squeekchain's public data. Not affiliated with Squeekchain.",
+    }),
+  ])) as ({ ok?: boolean } | null)[];
+
+  // Webhook and menu button are the ones that matter; the rest is cosmetic.
+  if (results[0]?.ok && results[1]?.ok) {
+    await kvPut(env.DB, "bot_setup", { origin, v: SETUP_VERSION }, now).run();
+  }
+}
 
 interface GlobalRow {
   human_revs: number;
@@ -121,9 +190,10 @@ function statePayload(h: HamsterState, g: GlobalRow, day: string) {
 
 // ---------------------------------------------------------------- API handlers
 
-async function handleState(env: Env): Promise<Response> {
+async function handleState(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const now = Date.now();
   const day = utcDay(now);
+  ctx.waitUntil(ensureBotSetup(env, new URL(req.url).origin).catch((e) => console.error("setup", e)));
   const [h, g] = await Promise.all([hamsterNow(env, now), globalToday(env, day)]);
   return json(env, statePayload(h, g, day));
 }
@@ -285,19 +355,22 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
   const cmd = text.split(/[\s@]/)[0].toLowerCase();
   const now = Date.now();
   const isPrivate = msg.chat.type === "private";
+  // Telegram calls us on our own origin, so that's the app URL.
+  const url = env.WEBAPP_URL || new URL(req.url).origin;
   const button = isPrivate
-    ? ({ text: "🐹 Spin the wheel", web_app: { url: env.WEBAPP_URL } } as InlineButton)
-    : spinButton(env);
+    ? ({ text: "🐹 Spin the wheel", web_app: { url } } as InlineButton)
+    : spinButton(env, url);
 
   if (cmd === "/start") {
     await sendMessage(
       env.BOT_TOKEN,
       chatId,
-      "🐹 <b>Squeek Wheel</b>\n\n" +
+      "🐹 <b>Squeektoshi game</b>\n\n" +
         "Squeektoshi mines blocks on a real wheel. Spin yours with him.\n\n" +
         "• He's running → his live rpm boosts every spin\n" +
         "• He's asleep → night shift: humans keep the wheel going, but 1000 human spins = 1 hamster turn\n\n" +
-        "/top — leaderboard · /hamster — is he running?",
+        "/top — leaderboard · /hamster — is he running?\n\n" +
+        "<i>Community game on Squeekchain's public data. Not affiliated with Squeekchain.</i>",
       [[button]],
     );
   } else if (cmd === "/hamster") {
@@ -379,7 +452,7 @@ async function everyMinute(env: Env) {
       event.kind === "woke"
         ? `🐹 <b>Squeektoshi woke up</b> and is running (${h.rpm.toFixed(0)} rpm).\nSpin with him now: boost ×${(boostMilli(true, h.rpm) / 1000).toFixed(1)}`
         : `😴 <b>Squeektoshi went to sleep</b> after ~${Math.max(1, Math.round(event.ranMs / 60000))} min of running.\nNight shift starts: 1000 human spins = 1 hamster turn.`;
-    await sendMessage(env.BOT_TOKEN, env.ALERT_CHAT_ID, text, [[spinButton(env)]]);
+    await sendMessage(env.BOT_TOKEN, env.ALERT_CHAT_ID, text, [[spinButton(env, await appUrl(env))]]);
   }
 }
 
@@ -423,7 +496,7 @@ async function dailyRecap(env: Env) {
       `🐹 Hamster: ${g.hamster_work.toLocaleString("en-US")} work units\n` +
       `🧑 Humans: ${g.human_revs.toLocaleString("en-US")} spins = ${hw.toFixed(2)} work units (${players?.n ?? 0} players)\n\n` +
       `${verdict}\n\n${podium}`,
-    [[spinButton(env)]],
+    [[spinButton(env, await appUrl(env))]],
   )) as { ok?: boolean } | null;
   // Only mark as sent on success: the cron retries every minute until 06:30 UTC.
   if (sent?.ok) {
@@ -434,11 +507,11 @@ async function dailyRecap(env: Env) {
 // ---------------------------------------------------------------- entry
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
     try {
-      if (pathname === "/api/state" && req.method === "GET") return await handleState(env);
+      if (pathname === "/api/state" && req.method === "GET") return await handleState(req, env, ctx);
       if (pathname === "/api/spin" && req.method === "POST") return await handleSpin(req, env);
       if (pathname === "/api/leaderboard" && req.method === "GET") return await handleLeaderboard(req, env);
       if (pathname === "/tg/webhook" && req.method === "POST") return await handleWebhook(req, env);
@@ -447,7 +520,8 @@ export default {
         await dailyRecap(env);
         return json(env, { ok: true });
       }
-      if (pathname === "/") return new Response("squeek-wheel ok");
+      // "/" is normally answered by the static mini-app; this only shows if assets are missing.
+      if (pathname === "/") return new Response("squeektoshi worker ok");
       return json(env, { error: "not_found" }, 404);
     } catch (e) {
       console.error(e);
